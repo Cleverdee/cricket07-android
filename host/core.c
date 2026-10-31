@@ -9,8 +9,8 @@
 #include <unistd.h>
 
 int g_log;
-char g_game_root[1024];
-char g_user_root[1024];
+char g_game_root[4096];
+char g_user_root[4096];
 
 /* ------------------------------------------------------------------ guest heap
  * Lives entirely in guest memory so the game can hold pointers into it. 16-byte header before each

@@ -346,6 +346,38 @@ static void state_hash_tick(uint32_t frame) {
             break;
         }
     }
+    /* On demand (finding game-state variables): with RC_SNAPSHOT_DIR set, a file <dir>/snap.req holding a
+       label makes the next check write rc_state_<label>.bin (and rc_heap_<label>.bin with RC_SNAPSHOT_HEAP)
+       and delete the request. Checked every 15 frames. */
+    static const char *sdir = (const char *)1;
+    if (sdir == (const char *)1) sdir = getenv("RC_SNAPSHOT_DIR");
+    if (sdir && frame % 15 == 0) {
+        char req[512], label[64] = "";
+        snprintf(req, sizeof req, "%s/snap.req", sdir);
+        FILE *rf = fopen(req, "r");
+        if (rf) {
+            if (!fgets(label, sizeof label, rf)) label[0] = 0;
+            fclose(rf);
+            remove(req);
+            label[strcspn(label, "\r\n /\\")] = 0;
+            if (!label[0]) snprintf(label, sizeof label, "f%u", frame);
+            char path[600];
+            snprintf(path, sizeof path, "%s/rc_state_%s.bin", sdir, label);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(HP(g_state_lo), 1, g_state_hi - g_state_lo, f); fclose(f); }
+            if (getenv("RC_SNAPSHOT_HEAP")) {
+                extern void guest_mem_ranges(uint32_t r[4]);
+                uint32_t r[4];
+                guest_mem_ranges(r);
+                snprintf(path, sizeof path, "%s/rc_heap_%s.bin", sdir, label);
+                if ((f = fopen(path, "wb"))) { fwrite(HP(r[0]), 1, r[1] - r[0], f); fclose(f); }
+            }
+            extern void gamephase_dump(const char *path);
+            snprintf(path, sizeof path, "%s/rc_tex_%s.txt", sdir, label);
+            gamephase_dump(path);   /* the textures drawn in the last frame */
+            fprintf(stderr, "[snapshot] %s at frame %u (globals %08x-%08x)\n", label, frame, g_state_lo, g_state_hi);
+        }
+    }
 }
 
 W(dev_Present) {
@@ -380,6 +412,8 @@ W(dev_Present) {
         extern uint32_t g_gpu_bind_groups_made;
         fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB, GPU textures %zu MB, bind groups made %u\n",
                 hu >> 20, vu >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made);
+        extern void gpu_stats_log(double secs, uint32_t frames);
+        if (last_t) gpu_stats_log(now - last_t, d->frame - last_f);
         last_t = now; last_f = d->frame;
     }
     if (g_render->present) g_render->present(d);

@@ -17,9 +17,18 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
+#ifdef __ANDROID__
+#include <webgpu/wgpu.h>   /* WGPUSurfaceConfigurationExtras */
+#endif
 
 extern int g_window_w, g_window_h;
-#ifndef __EMSCRIPTEN__
+#if defined(__ANDROID__)
+/* android/host/window_android.c: the app's ANativeWindow, replaced when Android recreates the surface */
+extern void *g_android_window;
+unsigned android_present_begin(void);
+void android_present_end(void);
+static unsigned g_android_gen;
+#elif !defined(__EMSCRIPTEN__)
 extern void *g_metal_layer;
 #endif
 
@@ -145,6 +154,29 @@ static void release_view(WGPUTextureView view);   /* drops cached bind groups us
 typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t used_in_batch, w, h, levels, fmt; size_t bytes; } GTex;
 int g_gpu_bc;               /* device has texture-compression-bc */
 size_t g_gpu_tex_bytes;     /* GPU memory in game textures, for the [mem] log */
+
+/* Per-command counts and host time, for the [gpu] line next to [fps] (RC_LOG_FPS=1) */
+enum { ST_DRAW, ST_UPLOAD_TEX, ST_UPLOAD_SURF, ST_READBACK, ST_PRESENT, ST_OTHER, ST_N };
+static uint32_t g_pc_hits, g_pc_waits, g_pc_shared, g_pc_built, g_pc_warmed;   /* pipelines: from the warm-up thread (waited for), the same as one made earlier, built by the game thread, warmed up */
+static struct { uint32_t n[ST_N]; double t[ST_N]; uint32_t submits, passes, passes_load; uint64_t upload_bytes; double acquire_t, submit_t, swap_t, pace_t, pt_wait_t; } g_st;
+void gpu_stats_log(double secs, uint32_t frames) {
+    static const char *names[ST_N] = { "draw", "tex upload", "surf upload", "readback", "present", "other" };
+    if (!frames) frames = 1;
+    char line[512];
+    int o = snprintf(line, sizeof line, "[gpu] per frame:");
+    for (int i = 0; i < ST_N; i++)
+        if (g_st.n[i]) o += snprintf(line + o, sizeof line - (size_t)o, " %s %.1fx %.2fms,", names[i],
+                                     (double)g_st.n[i] / frames, g_st.t[i] * 1000 / frames);
+    fprintf(stderr, "%s passes %.1f (%.1f loading color), submits %.1f, uploads %.0f KB | present: submit %.2fms acquire %.2fms swap %.2fms pace %.2fms, game waits %.2fms "
+            "(frame %.1fms)\n", line, (double)g_st.passes / frames, (double)g_st.passes_load / frames, (double)g_st.submits / frames, g_st.upload_bytes / 1024.0 / frames,
+            g_st.submit_t * 1000 / frames, g_st.acquire_t * 1000 / frames, g_st.swap_t * 1000 / frames,
+            g_st.pace_t * 1000 / frames, g_st.pt_wait_t * 1000 / frames, secs * 1000 / frames);
+    if (g_pc_hits || g_pc_built || g_pc_shared)
+        fprintf(stderr, "[gpu] new pipelines: %u built here, %u from the warm-up cache (%u waited for), %u shared\n", g_pc_built, g_pc_hits,
+                g_pc_waits, g_pc_shared);
+    g_pc_hits = g_pc_waits = g_pc_built = g_pc_shared = 0;
+    memset(&g_st, 0, sizeof g_st);
+}
 typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t w, h; int depth, gpu_dirty; } GSurf;
 
 static WGPUInstance g_inst;
@@ -153,8 +185,11 @@ static WGPUDevice g_dev;
 static WGPUQueue g_queue;
 static WGPUSurface g_surface;
 static WGPUTextureFormat g_surf_fmt;
+static WGPUCompositeAlphaMode g_surf_alpha = WGPUCompositeAlphaMode_Opaque;
 static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window */
 static int g_win_w, g_win_h;     /* window (swap chain) size; the back buffer is centred in it */
+static int g_cfg_window_w, g_cfg_window_h;   /* g_window_w/h the swap chain was configured for */
+static uint32_t g_present_modes;             /* bit per WGPUPresentMode the surface offers */
 static WGPUTexture g_depth;
 static WGPUTextureView g_depth_view;
 static WGPUTexture g_bb;          /* offscreen back buffer: always rendered, copied to the window when visible */
@@ -164,9 +199,62 @@ static WGPUBindGroupLayout g_bgl_u, g_bgl_t;
 static WGPUPipelineLayout g_pl;
 static WGPUBuffer g_vbuf, g_ubuf;
 static uint32_t g_vpos, g_upos;
+/* CPU copies of the vertex, uniform and vertex-shader-constant data of the batch being recorded: each
+   buffer is written to the GPU once per submit instead of once per draw (each wgpuQueueWriteBuffer
+   takes wgpu's queue lock, which the present thread holds while the driver blocks in present) */
+static uint8_t *g_vstage, *g_ustage, *g_cstage;
 #define VBUF_SIZE (32u << 20)
 #define UBUF_SIZE (8u << 20)
 #define USTRIDE 512u
+/* vertex shader constants (96 vec4) of draws whose vertex shader runs on the GPU: @group(2) */
+#define CBUF_SIZE (8u << 20)
+#define CSTRIDE 1536u
+static WGPUBindGroupLayout g_bgl_c;
+static WGPUPipelineLayout g_pl_vs;
+static WGPUBuffer g_cbuf;
+static WGPUBindGroup g_bg_c;
+static uint32_t g_cpos;
+/* contents of cached vertex buffers created since the last submit (exec_upload_vb) */
+typedef struct { WGPUBuffer buf; uint8_t *data; uint32_t bytes; } VbPending;
+static VbPending *g_pend;
+static size_t g_npend, g_cappend;
+
+/* Present thread (native): the game thread hands a finished frame over and goes on with the next one,
+ * while the present thread copies the back buffer into the window and presents it (vkQueuePresentKHR
+ * blocks there for ~20 ms on Mali). States: 0 idle, 1 frame handed over, 2 copy submitted (presenting).
+ * The game thread's next submit waits for state != 1, so the copy reads the back buffer before anything
+ * new is drawn into it; reconfiguring the surface waits for state 0. g_qlock: Vulkan queues need
+ * external synchronization, so submits and presents never run at once. RC_PRESENT_THREAD=0: inline. */
+#ifndef __EMSCRIPTEN__
+#include <pthread.h>
+static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_pt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pt_cond = PTHREAD_COND_INITIALIZER;
+static int g_pt_on, g_pt_state;
+static int g_pt_reconfig;   /* set by the present thread: 1 new Android surface, 2 reconfigure the surface */
+static void pt_wait(int idle) {
+    if (!g_pt_on) return;
+    pthread_mutex_lock(&g_pt_lock);
+    while (idle ? g_pt_state != 0 : g_pt_state == 1) pthread_cond_wait(&g_pt_cond, &g_pt_lock);
+    pthread_mutex_unlock(&g_pt_lock);
+}
+static void pt_set(int state) {
+    pthread_mutex_lock(&g_pt_lock);
+    g_pt_state = state;
+    pthread_cond_broadcast(&g_pt_cond);
+    pthread_mutex_unlock(&g_pt_lock);
+}
+static void queue_submit(WGPUCommandBuffer cb) {
+    pthread_mutex_lock(&g_qlock);
+    wgpuQueueSubmit(g_queue, 1, &cb);
+    pthread_mutex_unlock(&g_qlock);
+}
+static void start_present_thread(void);
+static void pipe_cache_start(void);   /* pipeline warm-up cache (pipelines section) */
+#else
+static void pt_wait(int idle) { (void)idle; }
+static void queue_submit(WGPUCommandBuffer cb) { wgpuQueueSubmit(g_queue, 1, &cb); }
+#endif
 static WGPUBindGroup g_bg_u;
 static GTex g_white, g_black;
 static WGPUSampler g_samplers[1024];   /* indexed by sampler key: never evicted while in use */
@@ -240,8 +328,24 @@ static void make_depth(void) {
 }
 
 static void configure_surface(void) {
+    g_cfg_window_w = g_window_w;
+    g_cfg_window_h = g_window_h;
     g_win_w = g_window_w > 0 ? g_window_w : 1024;
     g_win_h = g_window_h > 0 ? g_window_h : 768;
+#ifdef __ANDROID__
+    /* Phone GPUs are slow and screens dense: render a smaller swap chain and let the display hardware
+       scale it up, which costs nothing. RC_RENDER_HEIGHT sets its height (default 720; 0 = native). */
+    static int render_h = -1;
+    if (render_h < 0) {
+        const char *e = getenv("RC_RENDER_HEIGHT");
+        render_h = e ? atoi(e) : 720;
+        if (render_h < 0) render_h = 0;
+    }
+    if (render_h >= 240 && render_h < g_win_h) {
+        g_win_w = (int)((int64_t)g_win_w * render_h / g_win_h) & ~1;
+        g_win_h = render_h;
+    }
+#endif
     /* the game is 4:3: render at the largest 4:3 size that fits, letterboxed (no stretching) */
     if (g_win_w * 3 > g_win_h * 4) { g_surf_h = g_win_h; g_surf_w = g_win_h * 4 / 3; }
     else { g_surf_w = g_win_w; g_surf_h = g_win_w * 3 / 4; }
@@ -255,7 +359,25 @@ static void configure_surface(void) {
 #ifdef __EMSCRIPTEN__
     sc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
 #endif
-    sc.alphaMode = WGPUCompositeAlphaMode_Opaque;
+    sc.alphaMode = g_surf_alpha;
+#ifdef __ANDROID__
+    /* RC_PRESENT_MODE=fifo|mailbox|immediate (if the surface offers it) and RC_FRAME_LATENCY=N (frames
+       queued ahead of the display; wgpu's default is 2): for measuring where presents block */
+    const char *pm = getenv("RC_PRESENT_MODE");
+    WGPUPresentMode want = !pm ? WGPUPresentMode_Fifo : !strcmp(pm, "mailbox") ? WGPUPresentMode_Mailbox
+                         : !strcmp(pm, "immediate") ? WGPUPresentMode_Immediate : WGPUPresentMode_Fifo;
+    if (g_present_modes & (1u << want)) sc.presentMode = want;
+    WGPUSurfaceConfigurationExtras ext = { 0 };
+    const char *fl = getenv("RC_FRAME_LATENCY");
+    if (fl && atoi(fl) > 0) {
+        ext.chain.sType = (WGPUSType)WGPUSType_SurfaceConfigurationExtras;
+        ext.desiredMaximumFrameLatency = (uint32_t)atoi(fl);
+        sc.nextInChain = &ext.chain;
+    }
+    static int logged;
+    if (!logged++) fprintf(stderr, "[wgpu] present mode %d (offered mask %x), frame latency %s\n", (int)sc.presentMode,
+                           g_present_modes, fl ? fl : "default");
+#endif
     wgpuSurfaceConfigure(g_surface, &sc);
     make_depth();
 }
@@ -296,6 +418,18 @@ static void create_resources(void) {
     g_surf_fmt = caps.formatCount ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
     for (size_t i = 0; i < caps.formatCount; i++)   /* prefer a non-sRGB format: D3D8 blends in gamma space */
         if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm) g_surf_fmt = caps.formats[i];
+#ifdef __ANDROID__
+    if (g_surf_fmt != WGPUTextureFormat_BGRA8Unorm)
+        for (size_t i = 0; i < caps.formatCount; i++)
+            if (caps.formats[i] == WGPUTextureFormat_RGBA8Unorm) g_surf_fmt = caps.formats[i];
+#endif
+    /* Opaque where offered; some Android drivers (Mali on the Galaxy A17) only offer Inherit */
+    for (size_t i = 0; i < caps.presentModeCount; i++) g_present_modes |= 1u << caps.presentModes[i];
+    if (caps.alphaModeCount) g_surf_alpha = caps.alphaModes[0];
+    for (size_t i = 0; i < caps.alphaModeCount; i++)
+        if (caps.alphaModes[i] == WGPUCompositeAlphaMode_Opaque) g_surf_alpha = caps.alphaModes[i];
+    fprintf(stderr, "[wgpu] surface: format %d, alpha mode %d, usages %llx\n", (int)g_surf_fmt, (int)g_surf_alpha,
+            (unsigned long long)caps.usages);
     configure_surface();
 
     g_shader = make_module(WGSL_FF);
@@ -330,7 +464,7 @@ static void create_resources(void) {
     g_pl = wgpuDeviceCreatePipelineLayout(g_dev, &pld);
 
     WGPUBufferDescriptor bdesc = WGPU_BUFFER_DESCRIPTOR_INIT;
-    bdesc.size = VBUF_SIZE; bdesc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+    bdesc.size = VBUF_SIZE; bdesc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
     g_vbuf = wgpuDeviceCreateBuffer(g_dev, &bdesc);
     bdesc.size = UBUF_SIZE; bdesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     g_ubuf = wgpuDeviceCreateBuffer(g_dev, &bdesc);
@@ -339,15 +473,49 @@ static void create_resources(void) {
     WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bgd.layout = g_bgl_u; bgd.entryCount = 1; bgd.entries = &be;
     g_bg_u = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+
+    WGPUBindGroupLayoutEntry ce = ue;
+    ce.visibility = WGPUShaderStage_Vertex;
+    ce.buffer.minBindingSize = CSTRIDE;
+    bd.entryCount = 1; bd.entries = &ce;
+    g_bgl_c = wgpuDeviceCreateBindGroupLayout(g_dev, &bd);
+    WGPUBindGroupLayout lc[3] = { g_bgl_u, g_bgl_t, g_bgl_c };
+    pld.bindGroupLayoutCount = 3; pld.bindGroupLayouts = lc;
+    g_pl_vs = wgpuDeviceCreatePipelineLayout(g_dev, &pld);
+    bdesc.size = CBUF_SIZE; bdesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    g_cbuf = wgpuDeviceCreateBuffer(g_dev, &bdesc);
+    g_vstage = malloc(VBUF_SIZE);   /* only the pages a frame uses are ever touched */
+    g_ustage = malloc(UBUF_SIZE);
+    g_cstage = malloc(CBUF_SIZE);
+    be.buffer = g_cbuf; be.size = CSTRIDE;
+    bgd.layout = g_bgl_c;
+    g_bg_c = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+
     make_solid(&g_white, 255);
     make_solid(&g_black, 0);   /* pixel shaders sampling an empty stage read (0, 0, 0, 1) */
     fprintf(stderr, "[wgpu] renderer ready: rendering at %dx%d in a %dx%d window\n", g_surf_w, g_surf_h, g_win_w, g_win_h);
 }
 
 
+#ifdef __ANDROID__
+static void android_create_surface(void) {
+    WGPUSurfaceSourceAndroidNativeWindow aw = WGPU_SURFACE_SOURCE_ANDROID_NATIVE_WINDOW_INIT;
+    aw.window = g_android_window;
+    WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
+    sd.nextInChain = &aw.chain;
+    g_surface = wgpuInstanceCreateSurface(g_inst, &sd);
+}
+#endif
+
 #ifndef __EMSCRIPTEN__
 int gpu_init_native(void) {
     if (g_dev) return 1;
+#ifdef __ANDROID__
+    g_inst = wgpuCreateInstance(NULL);
+    g_android_gen = android_present_begin();   /* waits for the first surface */
+    android_create_surface();
+    android_present_end();
+#else
     if (!g_metal_layer) { fprintf(stderr, "[wgpu] no window\n"); return 0; }
     g_inst = wgpuCreateInstance(NULL);
     WGPUSurfaceSourceMetalLayer ml = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;
@@ -355,6 +523,7 @@ int gpu_init_native(void) {
     WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
     sd.nextInChain = &ml.chain;
     g_surface = wgpuInstanceCreateSurface(g_inst, &sd);
+#endif
 
     WGPURequestAdapterOptions ao = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
     ao.compatibleSurface = g_surface;
@@ -380,6 +549,8 @@ int gpu_init_native(void) {
     while (!g_dev) wgpuInstanceProcessEvents(g_inst);
     g_queue = wgpuDeviceGetQueue(g_dev);
     create_resources();
+    start_present_thread();
+    pipe_cache_start();
     return 1;
 }
 #endif
@@ -448,7 +619,7 @@ static void capture_png(const char *path) {
     WGPUExtent3D ex = { w, h, 1 };
     wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ex);
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
-    wgpuQueueSubmit(g_queue, 1, &cb);
+    queue_submit(cb);
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
     WGPUBufferMapCallbackInfo mci = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -487,10 +658,128 @@ static WGPUSampler sampler_for(uint32_t key) {
     return g_samplers[key];
 }
 
+/* ------------------------------------------------------------------ pipeline warm-up cache
+ *
+ * Creating a pipeline the first time costs 25-56 ms on Mali (naga's SPIR-V output plus the driver's
+ * compile), which showed as a stutter whenever new players or objects appeared. wgpu-native has no
+ * pipeline-cache API, so every pipeline's recipe is kept instead: userdata/gpu_pipelines.bin holds the
+ * WGSL of each translated shader ('S' records) and each pipeline's state with its shaders named by the
+ * hash of their WGSL ('P' records), appended as they are first created. At the next launch a background
+ * thread recreates them all in first-use order, and pipeline_for takes the finished ones (or waits for
+ * one being built). Shader modules are shared by WGSL hash, so the game thread doesn't parse them again.
+ * RC_PIPE_CACHE=0 turns it off. */
+
+static WGPUShaderModule make_module(const char *fragment);
+
+static uint64_t fnv64(const void *p, size_t n, uint64_t h) {
+    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 0x100000001b3ull;
+    return h;
+}
+#define FNV64 0xcbf29ce484222325ull
+
+/* a pipeline independent of this launch's shader handles: k.ps / k.vs are just 0 or 1 */
+typedef struct { PKey k; uint64_t psh, vsh; } WKey;
+static WKey wkey(const PKey *k, uint64_t psh, uint64_t vsh) {
+    WKey w;
+    memset(&w, 0, sizeof w);
+    w.k = *k; w.k.ps = psh != 0; w.k.vs = vsh != 0; w.psh = psh; w.vsh = vsh;
+    return w;
+}
+
+#ifndef __EMSCRIPTEN__
+static pthread_mutex_t g_wlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wcond = PTHREAD_COND_INITIALIZER;
+#define WLOCK() pthread_mutex_lock(&g_wlock)
+#define WUNLOCK() pthread_mutex_unlock(&g_wlock)
+#else
+#define WLOCK() ((void)0)
+#define WUNLOCK() ((void)0)
+#endif
+
+/* shader modules by the hash of their WGSL */
+#define NMODS 4096
+static struct { uint64_t h; WGPUShaderModule m; } g_mods[NMODS];
+static WGPUShaderModule module_cached(const char *wgsl, uint64_t h) {
+    WLOCK();
+    uint32_t i = (uint32_t)h % NMODS, n = 0;
+    while (g_mods[i].m && g_mods[i].h != h && n++ < NMODS) i = (i + 1) % NMODS;
+    WGPUShaderModule m = g_mods[i].h == h ? g_mods[i].m : NULL;
+    WUNLOCK();
+    if (m) return m;
+    m = make_module(wgsl);
+    WLOCK();
+    if (g_mods[i].m && g_mods[i].h == h) { wgpuShaderModuleRelease(m); m = g_mods[i].m; }   /* the other thread won */
+    else if (!g_mods[i].m) { g_mods[i].h = h; g_mods[i].m = m; }
+    WUNLOCK();
+    return m;
+}
+
+/* the records already in the file (shader hashes and pipeline-key hashes), so nothing is written twice */
+#define NKNOWN 16384
+static uint64_t g_known[NKNOWN];
+static int known_add(uint64_t h) {   /* 1 if it wasn't known yet */
+    if (!h) h = 1;
+    uint32_t i = (uint32_t)h % NKNOWN;
+    for (uint32_t n = 0; n < NKNOWN; n++, i = (i + 1) % NKNOWN) {
+        if (g_known[i] == h) return 0;
+        if (!g_known[i]) { g_known[i] = h; return 1; }
+    }
+    return 0;
+}
+
+/* pipelines from the file: p is NULL while being built; taken once pipeline_for owns it (or builds it) */
+#define NWARM 4096
+typedef struct { WKey w; WGPURenderPipeline p; int used, taken; } WEntry;
+static WEntry g_warm[NWARM];
+static WEntry *warm_slot(const WKey *w) {
+    uint64_t h = fnv64(w, sizeof *w, FNV64);
+    uint32_t i = (uint32_t)h % NWARM;
+    for (uint32_t n = 0; n < NWARM; n++, i = (i + 1) % NWARM)
+        if (!g_warm[i].used || !memcmp(&g_warm[i].w, w, sizeof *w)) return &g_warm[i];
+    return NULL;
+}
+
+#ifndef __EMSCRIPTEN__
+extern char g_user_root[4096];
+static FILE *g_pcf;   /* the cache file, open for appending (NULL: cache off) */
+static uint8_t *g_pc_data;   /* the file as read at startup: the warm-up thread's work */
+static size_t g_pc_len;
+#define PC_MAGIC 0x31435052u   /* "RPC1" */
+
+static void pc_write(const void *rec, size_t n) {
+    if (!g_pcf) return;
+    fwrite(rec, 1, n, g_pcf);
+    fflush(g_pcf);
+}
+static void pc_shader(uint64_t h, int nin, const char *wgsl) {
+    WLOCK();
+    int fresh = g_pcf && known_add(h);
+    WUNLOCK();
+    if (!fresh) return;
+    uint32_t len = (uint32_t)strlen(wgsl);
+    uint8_t hd[17];
+    hd[0] = 'S'; memcpy(hd + 1, &h, 8); memcpy(hd + 9, &nin, 4); memcpy(hd + 13, &len, 4);
+    WLOCK();
+    pc_write(hd, sizeof hd);
+    pc_write(wgsl, len);
+    WUNLOCK();
+}
+static void pc_pipeline(const WKey *w) {
+    uint8_t rec[1 + sizeof *w];
+    rec[0] = 'P'; memcpy(rec + 1, w, sizeof *w);
+    WLOCK();
+    if (g_pcf && known_add(fnv64(w, sizeof *w, FNV64))) pc_write(rec, sizeof rec);
+    WUNLOCK();
+}
+#else
+static void pc_shader(uint64_t h, int nin, const char *wgsl) { (void)h; (void)nin; (void)wgsl; }
+static void pc_pipeline(const WKey *w) { (void)w; }
+#endif
+
 /* ------------------------------------------------------------------ pixel shaders */
 
 char *ps_to_wgsl(const uint32_t *code, uint32_t n, char *why, size_t why_n);
-typedef struct { WGPUShaderModule module; } PsProgram;
+typedef struct { WGPUShaderModule module; uint64_t hash; } PsProgram;
 
 /* NULL when the shader can't be translated: such draws use the fixed-function stage instead */
 static PsProgram *ps_program(uint32_t handle) {
@@ -505,22 +794,44 @@ static PsProgram *ps_program(uint32_t handle) {
         return NULL;
     }
     PsProgram *p = calloc(1, sizeof *p);
-    p->module = make_module(fs);
+    p->hash = fnv64(fs, strlen(fs), FNV64) | 1;
+    p->module = module_cached(fs, p->hash);
+    pc_shader(p->hash, -1, fs);
     if (getenv("RC_DUMP_PS")) fprintf(stderr, "[ps %x]\n%s", handle, fs);
     free(fs);
     sh->backend = p;
     return p;
 }
-static WGPUShaderModule module_for_ps(uint32_t ps) {
-    PsProgram *p = ps ? ps_program(ps) : NULL;
-    return p ? p->module : g_shader;
+
+/* ------------------------------------------------------------------ vertex shaders */
+
+#include "vshader.h"
+
+typedef struct { WGPUShaderModule module; uint64_t hash; int nin; } VsGpu;
+
+/* the vertex stage of a vs.1.1 shader (entry point "vsp"); NULL if it can't be translated */
+static VsGpu *vs_gpu(uint32_t handle) {
+    Shader *sh = shader_get(handle);
+    if (!sh || sh->pixel) return NULL;
+    if (sh->gpu) return sh->gpu == (void *)1 ? NULL : sh->gpu;
+    char *vs = vs_to_wgsl(sh);
+    if (!vs) { fprintf(stderr, "[wgpu] vertex shader %x not translated\n", handle); sh->gpu = (void *)1; return NULL; }
+    if (getenv("RC_DUMP_VS_WGSL")) fprintf(stderr, "[vs %x]\n%s", handle, vs);
+    VsGpu *g = calloc(1, sizeof *g);
+    g->hash = fnv64(vs, strlen(vs), FNV64) | 1;
+    g->nin = vs_gpu_inputs(sh);
+    g->module = module_cached(vs, g->hash);
+    pc_shader(g->hash, g->nin, vs);
+    free(vs);
+    sh->gpu = g;
+    return g;
 }
 
 /* ------------------------------------------------------------------ pipelines */
 
-static WGPUShaderModule module_for_ps(uint32_t ps);
 typedef struct { PKey k; WGPURenderPipeline p; } PEntry;
-static PEntry g_pipes[512];
+#define NPIPES 2048
+static PEntry g_pipes[NPIPES];
 
 static WGPUBlendFactor bf(uint32_t b) {
     switch (b) {
@@ -549,55 +860,227 @@ static WGPUBlendOperation bop(uint32_t o) {
                  default: return WGPUBlendOperation_Add; }
 }
 
+/* fm: the fragment stage's module (a pixel shader's, else the fixed-function one, which also has the
+   fixed-function vertex stage); vm: the game's vertex shader with nin inputs, or NULL */
+static WGPURenderPipeline make_pipeline(const PKey *k, WGPUShaderModule fm, WGPUShaderModule vm, int nin) {
+    WGPUVertexAttribute at[7] = {
+        { NULL, WGPUVertexFormat_Float32x4, 0, 0 }, { NULL, WGPUVertexFormat_Uint32, 16, 1 },
+        { NULL, WGPUVertexFormat_Uint32, 20, 2 }, { NULL, WGPUVertexFormat_Float32x4, 24, 3 },
+        { NULL, WGPUVertexFormat_Float32x4, 40, 4 }, { NULL, WGPUVertexFormat_Float32x4, 56, 5 },
+        { NULL, WGPUVertexFormat_Float32x4, 72, 6 },
+    };
+    WGPUVertexBufferLayout vbl = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+    vbl.arrayStride = sizeof(CVert); vbl.attributeCount = 7; vbl.attributes = at;
+    vbl.stepMode = WGPUVertexStepMode_Vertex;
+    WGPUBlendState bs = WGPU_BLEND_STATE_INIT;
+    bs.color.srcFactor = bf(k->src); bs.color.dstFactor = bf(k->dst); bs.color.operation = bop(k->op);
+    bs.alpha = bs.color;
+    WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
+    ct.format = g_surf_fmt;
+    ct.blend = k->blend ? &bs : NULL;
+    ct.writeMask = (k->cmask & 1 ? WGPUColorWriteMask_Red : 0) | (k->cmask & 2 ? WGPUColorWriteMask_Green : 0) |
+                   (k->cmask & 4 ? WGPUColorWriteMask_Blue : 0) | (k->cmask & 8 ? WGPUColorWriteMask_Alpha : 0);
+    WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+    fs.module = fm; fs.entryPoint = sv("fs"); fs.targetCount = 1; fs.targets = &ct;
+    WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+    ds.format = WGPUTextureFormat_Depth24PlusStencil8;
+    ds.depthWriteEnabled = k->zen && k->zwrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+    ds.depthCompare = k->zen ? cmpf(k->zfunc) : WGPUCompareFunction_Always;
+    WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pd.layout = g_pl;
+    pd.vertex.module = fm; pd.vertex.entryPoint = sv("vs");
+    pd.vertex.bufferCount = 1; pd.vertex.buffers = &vbl;
+    WGPUVertexAttribute vat[16];
+    if (vm) {   /* the game's vertex shader: one vec4 per input register it reads */
+        for (int a = 0; a < nin && a < 16; a++)
+            vat[a] = (WGPUVertexAttribute){ NULL, WGPUVertexFormat_Float32x4, 16u * (uint32_t)a, (uint32_t)a };
+        vbl.arrayStride = 16u * (uint32_t)(nin > 0 ? nin : 1);
+        vbl.attributeCount = (size_t)(nin > 0 ? nin : 0); vbl.attributes = vat;
+        pd.layout = g_pl_vs;
+        pd.vertex.module = vm; pd.vertex.entryPoint = sv("vsp");
+    }
+    pd.primitive.topology = (WGPUPrimitiveTopology)k->topo;
+    pd.primitive.frontFace = WGPUFrontFace_CW;
+    pd.primitive.cullMode = k->cull == 2 ? WGPUCullMode_Front : k->cull == 3 ? WGPUCullMode_Back : WGPUCullMode_None;
+    pd.depthStencil = &ds;
+    pd.fragment = &fs;
+    pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
+    return wgpuDeviceCreateRenderPipeline(g_dev, &pd);
+}
+
+/* g_warm maps every pipeline made this session (and those from the file) by WKey: the game creates
+   identical shaders under new handles for each player and object, so most new PKeys are a pipeline that
+   already exists. Returns it (waiting if the warm-up thread is building it), else NULL after marking the
+   slot taken, so the warm-up thread leaves it to the caller, who hands the result to warm_put. */
+static WGPURenderPipeline warm_take(const WKey *w) {
+    WGPURenderPipeline p = NULL;
+    WLOCK();
+    WEntry *e = warm_slot(w);
+    if (e && e->used) {
+#ifndef __EMSCRIPTEN__
+        if (!e->taken) {
+            if (!e->p) g_pc_waits++;
+            while (!e->p && !e->taken) pthread_cond_wait(&g_wcond, &g_wlock);
+            if (e->p) g_pc_hits++;
+        } else
+#endif
+        if (e->p) g_pc_shared++;
+        p = e->p;
+    } else if (e) {
+        e->used = 1; e->w = *w;
+    }
+    if (e) e->taken = 1;
+    WUNLOCK();
+    return p;
+}
+static void warm_put(const WKey *w, WGPURenderPipeline p) {
+    WLOCK();
+    WEntry *e = warm_slot(w);
+    if (e && (!e->used || !e->p)) { e->used = e->taken = 1; e->w = *w; e->p = p; }
+    WUNLOCK();
+}
+
 static WGPURenderPipeline pipeline_for(const PKey *k) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < sizeof *k / 4; i++) h = (h ^ ((const uint32_t *)k)[i]) * 16777619u;
-    for (uint32_t i = 0; i < 512; i++) {
-        PEntry *e = &g_pipes[(h + i) % 512];
+    for (uint32_t i = 0; i < NPIPES; i++) {
+        PEntry *e = &g_pipes[(h + i) % NPIPES];
         if (e->p && !memcmp(&e->k, k, sizeof *k)) return e->p;
         if (!e->p) {
-            WGPUVertexAttribute at[7] = {
-                { NULL, WGPUVertexFormat_Float32x4, 0, 0 }, { NULL, WGPUVertexFormat_Uint32, 16, 1 },
-                { NULL, WGPUVertexFormat_Uint32, 20, 2 }, { NULL, WGPUVertexFormat_Float32x4, 24, 3 },
-                { NULL, WGPUVertexFormat_Float32x4, 40, 4 }, { NULL, WGPUVertexFormat_Float32x4, 56, 5 },
-                { NULL, WGPUVertexFormat_Float32x4, 72, 6 },
-            };
-            WGPUVertexBufferLayout vbl = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
-            vbl.arrayStride = sizeof(CVert); vbl.attributeCount = 7; vbl.attributes = at;
-            vbl.stepMode = WGPUVertexStepMode_Vertex;
-            WGPUBlendState bs = WGPU_BLEND_STATE_INIT;
-            bs.color.srcFactor = bf(k->src); bs.color.dstFactor = bf(k->dst); bs.color.operation = bop(k->op);
-            bs.alpha = bs.color;
-            WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
-            ct.format = g_surf_fmt;
-            ct.blend = k->blend ? &bs : NULL;
-            ct.writeMask = (k->cmask & 1 ? WGPUColorWriteMask_Red : 0) | (k->cmask & 2 ? WGPUColorWriteMask_Green : 0) |
-                           (k->cmask & 4 ? WGPUColorWriteMask_Blue : 0) | (k->cmask & 8 ? WGPUColorWriteMask_Alpha : 0);
-            WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
-            WGPUShaderModule mod = module_for_ps(k->ps);
-            fs.module = mod; fs.entryPoint = sv("fs"); fs.targetCount = 1; fs.targets = &ct;
-            WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
-            ds.format = WGPUTextureFormat_Depth24PlusStencil8;
-            ds.depthWriteEnabled = k->zen && k->zwrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
-            ds.depthCompare = k->zen ? cmpf(k->zfunc) : WGPUCompareFunction_Always;
-            WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-            pd.layout = g_pl;
-            pd.vertex.module = mod; pd.vertex.entryPoint = sv("vs");
-            pd.vertex.bufferCount = 1; pd.vertex.buffers = &vbl;
-            pd.primitive.topology = (WGPUPrimitiveTopology)k->topo;
-            pd.primitive.frontFace = WGPUFrontFace_CW;
-            pd.primitive.cullMode = k->cull == 2 ? WGPUCullMode_Front : k->cull == 3 ? WGPUCullMode_Back : WGPUCullMode_None;
-            pd.depthStencil = &ds;
-            pd.fragment = &fs;
-            pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
+            PsProgram *ps = k->ps ? ps_program(k->ps) : NULL;
+            VsGpu *vs = NULL;
+            if (k->vs && !(vs = vs_gpu(k->vs))) return NULL;
+            WKey w = wkey(k, ps ? ps->hash : 0, vs ? vs->hash : 0);
+            WGPURenderPipeline p = warm_take(&w);
+            if (!p) {
+                p = make_pipeline(k, ps ? ps->module : g_shader, vs ? vs->module : NULL, vs ? vs->nin : 0);
+                warm_put(&w, p);
+                pc_pipeline(&w);
+                g_pc_built++;
+            }
             e->k = *k;
-            e->p = wgpuDeviceCreateRenderPipeline(g_dev, &pd);
+            e->p = p;
             return e->p;
         }
     }
-    fprintf(stderr, "[wgpu] pipeline cache full\n");
-    return g_pipes[0].p;
+    static int warned;
+    if (!warned++) fprintf(stderr, "[wgpu] pipeline cache full\n");
+    return NULL;
 }
+
+#ifndef __EMSCRIPTEN__
+/* the 'S' record with hash h in the startup file: its WGSL (not NUL-terminated) and input count */
+static const uint8_t *pc_find_shader(uint64_t h, uint32_t *len, int *nin) {
+    for (size_t o = 16; o < g_pc_len;) {
+        uint8_t t = g_pc_data[o];
+        if (t == 'P') { o += 1 + sizeof(WKey); continue; }
+        uint64_t sh; uint32_t n;
+        memcpy(&sh, g_pc_data + o + 1, 8); memcpy(nin, g_pc_data + o + 9, 4); memcpy(&n, g_pc_data + o + 13, 4);
+        if (sh == h) { *len = n; return g_pc_data + o + 17; }
+        o += 17 + n;
+    }
+    return NULL;
+}
+static WGPUShaderModule pc_module(uint64_t h, int *nin) {
+    uint32_t len;
+    const uint8_t *s = pc_find_shader(h, &len, nin);
+    if (!s) return NULL;
+    char *z = malloc(len + 1);
+    memcpy(z, s, len); z[len] = 0;
+    WGPUShaderModule m = module_cached(z, h);
+    free(z);
+    return m;
+}
+
+static void *warm_thread(void *arg) {
+    (void)arg;
+    double t0 = host_seconds();
+    for (size_t o = 16; o < g_pc_len;) {
+        if (g_pc_data[o] == 'S') { uint32_t n; memcpy(&n, g_pc_data + o + 13, 4); o += 17 + n; continue; }
+        WKey w;
+        memcpy(&w, g_pc_data + o + 1, sizeof w);
+        o += 1 + sizeof w;
+        WLOCK();
+        WEntry *e = warm_slot(&w);
+        int mine = e && !e->used;
+        if (mine) { e->used = 1; e->w = w; }
+        WUNLOCK();
+        if (!mine) continue;   /* the game got there first */
+        int nin = 0, unused;
+        WGPUShaderModule fm = w.psh ? pc_module(w.psh, &unused) : g_shader;
+        WGPUShaderModule vm = w.vsh ? pc_module(w.vsh, &nin) : NULL;
+        WGPURenderPipeline p = fm && (vm || !w.vsh) ? make_pipeline(&w.k, fm, vm, nin) : NULL;
+        WLOCK();
+        if (p) { e->p = p; g_pc_warmed++; }
+        else e->taken = 1;   /* a shader is missing: whoever waits builds it */
+        pthread_cond_broadcast(&g_wcond);
+        WUNLOCK();
+    }
+    fprintf(stderr, "[wgpu] pipeline warm-up: %u pipelines in %.1f s\n", g_pc_warmed, host_seconds() - t0);
+    free(g_pc_data);
+    g_pc_data = NULL;
+    return NULL;
+}
+
+/* open userdata/gpu_pipelines.bin: keep a valid one to warm up from and append to, else start it over */
+static void pipe_cache_start(void) {
+    const char *e = getenv("RC_PIPE_CACHE");
+    if (e && !atoi(e)) return;
+    char path[4200];
+    snprintf(path, sizeof path, "%s/gpu_pipelines.bin", g_user_root);
+    /* the file is only valid for this surface format and these shared shader parts */
+    uint32_t hdr[4] = { PC_MAGIC, (uint32_t)g_surf_fmt, 0, (uint32_t)sizeof(WKey) };
+    uint64_t sh = fnv64(WGSL_COMMON, strlen(WGSL_COMMON), FNV64);
+    hdr[2] = (uint32_t)fnv64(WGSL_FF, strlen(WGSL_FF), sh);
+    size_t good = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n >= 16) {
+            g_pc_data = malloc((size_t)n);
+            g_pc_len = fread(g_pc_data, 1, (size_t)n, f);
+        }
+        fclose(f);
+    }
+    if (g_pc_data && g_pc_len >= 16 && !memcmp(g_pc_data, hdr, 16)) {
+        /* index what is there; a record cut short by the app being killed ends the file */
+        size_t o = 16;
+        uint32_t npipes = 0;
+        while (o < g_pc_len) {
+            uint8_t t = g_pc_data[o];
+            if (t == 'P' && o + 1 + sizeof(WKey) <= g_pc_len) {
+                known_add(fnv64(g_pc_data + o + 1, sizeof(WKey), FNV64));
+                o += 1 + sizeof(WKey); npipes++;
+            } else if (t == 'S' && o + 17 <= g_pc_len) {
+                uint64_t h; uint32_t len;
+                memcpy(&h, g_pc_data + o + 1, 8); memcpy(&len, g_pc_data + o + 13, 4);
+                if (o + 17 + len > g_pc_len) break;
+                known_add(h);
+                o += 17 + len;
+            } else break;
+        }
+        good = o;
+        g_pc_len = o;
+        fprintf(stderr, "[wgpu] pipeline cache: %u pipelines in %s\n", npipes, path);
+    } else {
+        free(g_pc_data);
+        g_pc_data = NULL; g_pc_len = 0;
+    }
+    if (good) {
+        if (truncate(path, (off_t)good) != 0) good = 0;
+    }
+    g_pcf = fopen(path, good ? "ab" : "wb");
+    if (!g_pcf) { fprintf(stderr, "[wgpu] pipeline cache: can't write %s\n", path); return; }
+    if (!good) pc_write(hdr, sizeof hdr);
+    if (g_pc_data) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, warm_thread, NULL) == 0) pthread_detach(t);
+        else { free(g_pc_data); g_pc_data = NULL; }
+    }
+}
+#endif
 
 /* ------------------------------------------------------------------ frames and passes */
 
@@ -657,20 +1140,35 @@ static void submit(void) {
     end_pass();
     if (g_enc) {
         WGPUCommandBuffer cb = wgpuCommandEncoderFinish(g_enc, NULL);
-        wgpuQueueSubmit(g_queue, 1, &cb);
+        double t_w = host_seconds();
+        pt_wait(0);   /* the present thread's copy must read the back buffer before these draws */
+        g_st.pt_wait_t += host_seconds() - t_w;
+        /* the batch's data, written ahead of the commands that read it (queue order) */
+        if (g_vpos) wgpuQueueWriteBuffer(g_queue, g_vbuf, 0, g_vstage, g_vpos);
+        if (g_upos) wgpuQueueWriteBuffer(g_queue, g_ubuf, 0, g_ustage, g_upos);
+        if (g_cpos) wgpuQueueWriteBuffer(g_queue, g_cbuf, 0, g_cstage, g_cpos);
+        for (size_t i = 0; i < g_npend; i++) {
+            wgpuQueueWriteBuffer(g_queue, g_pend[i].buf, 0, g_pend[i].data, g_pend[i].bytes);
+            wgpuBufferRelease(g_pend[i].buf);
+            free(g_pend[i].data);
+        }
+        g_npend = 0;
+        queue_submit(cb);
         wgpuCommandBufferRelease(cb);
         wgpuCommandEncoderRelease(g_enc);
         g_enc = NULL;
+        g_st.submits++;
     }
     destroy_retired();   /* nothing recorded can use them any more */
-    g_vpos = g_upos = 0;
+    g_vpos = g_upos = g_cpos = 0;
     g_batch++;
 }
 
 static void begin_frame(void) {
     if (g_frame_open) return;
-    if (g_window_w != g_win_w || g_window_h != g_win_h) {
+    if (g_window_w != g_cfg_window_w || g_window_h != g_cfg_window_h) {
         end_pass();
+        pt_wait(1);   /* not while the present thread uses the surface */
         configure_surface();
         g_tgt_color = g_tgt_depth = NULL;
         g_tgt_w = (uint32_t)g_surf_w; g_tgt_h = (uint32_t)g_surf_h;
@@ -700,6 +1198,8 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
     rp.depthStencilAttachment = &da;
     g_pass = wgpuCommandEncoderBeginRenderPass(g_enc, &rp);
+    g_st.passes++;
+    if (!(clear & 1)) g_st.passes_load++;
 }
 
 /* ------------------------------------------------------------------ render targets */
@@ -813,7 +1313,7 @@ static WGPUBuffer start_readback(const CmdReadback *c, uint32_t *gw, uint32_t *g
     WGPUExtent3D ex = { *gw, *gh, 1 };
     wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ex);
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
-    wgpuQueueSubmit(g_queue, 1, &cb);
+    queue_submit(cb);
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
     if (gs) gs->gpu_dirty = 0;
@@ -825,6 +1325,46 @@ static void finish_readback(const CmdReadback *c) {
 }
 
 /* ------------------------------------------------------------------ commands */
+
+/* Converted vertices of unchanging Direct3D vertex buffers (render_rec.c's cache), by id. Releasing one
+   only drops a reference: draws already recorded keep it alive until they have run. */
+int g_gpu_vb_cache = 1;   /* tells the recorder these commands are handled */
+typedef struct { WGPUBuffer buf; uint32_t bytes; } GVb;
+size_t g_gpu_vb_bytes;
+
+static void exec_upload_vb(const CmdUploadVb *c) {
+    GVb *g = calloc(1, sizeof *g);
+    WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+    bd.size = (c->bytes + 3) & ~3u;
+    bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+    g->buf = wgpuDeviceCreateBuffer(g_dev, &bd);
+    g->bytes = c->bytes;
+    /* written at the next submit, ahead of the draws that read it (like the staging buffers: a queue write
+       now could wait for the present thread) */
+    if (g_npend == g_cappend) {
+        g_cappend = g_cappend ? g_cappend * 2 : 64;
+        g_pend = realloc(g_pend, g_cappend * sizeof *g_pend);
+    }
+    VbPending *pe = &g_pend[g_npend++];
+    pe->buf = g->buf;
+    wgpuBufferAddRef(g->buf);   /* in case it is destroyed before the submit */
+    pe->bytes = (uint32_t)bd.size;
+    pe->data = malloc(pe->bytes);
+    memcpy(pe->data, c + 1, c->bytes);
+    memset(pe->data + c->bytes, 0, pe->bytes - c->bytes);
+    g_st.upload_bytes += c->bytes;
+    g_gpu_vb_bytes += c->bytes;
+    obj_put(c->id, g);
+}
+
+static void exec_destroy_vb(uint32_t id) {
+    GVb *g = obj_get(id);
+    if (!g) return;
+    wgpuBufferRelease(g->buf);
+    g_gpu_vb_bytes -= g->bytes;
+    free(g);
+    obj_del(id);
+}
 
 static void exec_upload_tex(const CmdUploadTex *c) {
     GTex *g = obj_get(c->id);
@@ -871,6 +1411,7 @@ static void exec_upload_tex(const CmdUploadTex *c) {
             n = (size_t)c->w[l] * c->h_[l] * 4;
         }
         wgpuQueueWriteTexture(g_queue, &dst, px, n, &lay, &ex);
+        g_st.upload_bytes += n;
         px += n;
     }
 }
@@ -918,8 +1459,17 @@ static void exec_clear(const CmdClear *c) {
 static void exec_draw(const CmdDraw *c) {
     begin_frame();
     if (!g_pass) begin_pass(0, 0, 1.f, 0);
-    uint32_t n = c->nverts, bytes = n * (uint32_t)sizeof(CVert);
-    if (g_vpos + bytes > VBUF_SIZE || g_upos + USTRIDE > UBUF_SIZE) { submit(); begin_pass(0, 0, 1.f, 0); }
+    /* vertex shader on the GPU: its constants, then its input registers per vertex (render_cmd.h) */
+    const float *vs_consts = c->key.vs ? (const float *)(c + 1) : NULL;
+    const void *verts = c->key.vs ? (const void *)(vs_consts + 96 * 4) : (const void *)(c + 1);
+    /* vb_id: verts are uint32 indices into a cached vertex buffer */
+    GVb *gvb = c->vb_id ? obj_get(c->vb_id) : NULL;
+    if (c->vb_id && !gvb) return;
+    uint32_t n = c->nverts, bytes = n * (gvb ? 4u : c->key.vs ? c->vs_stride : (uint32_t)sizeof(CVert));
+    uint32_t ibytes = gvb ? 0 : c->nidx * 4;   /* indices into this draw's own vertices follow them */
+    if (g_vpos + bytes + ibytes > VBUF_SIZE || g_upos + USTRIDE > UBUF_SIZE || g_cpos + CSTRIDE > CBUF_SIZE) {
+        submit(); begin_pass(0, 0, 1.f, 0);
+    }
 
     PsProgram *ps = c->key.ps ? ps_program(c->key.ps) : NULL;
     WGPUTextureView views[4];
@@ -934,8 +1484,8 @@ static void exec_draw(const CmdDraw *c) {
             views[s] = gs && !gs->depth && gs->view != g_tgt_color ? gs->view : g_black.view;
         }
     }
-    wgpuQueueWriteBuffer(g_queue, g_vbuf, g_vpos, c + 1, bytes);
-    wgpuQueueWriteBuffer(g_queue, g_ubuf, g_upos, &c->u, sizeof c->u);
+    memcpy(g_vstage + g_vpos, verts, bytes + ibytes);
+    memcpy(g_ustage + g_upos, &c->u, sizeof c->u);
 
     WGPUBindGroupEntry te[8];
     for (int i = 0; i < 4; i++) {
@@ -967,6 +1517,7 @@ static void exec_draw(const CmdDraw *c) {
     PKey k = c->key;
     if (!ps) k.ps = 0;
     WGPURenderPipeline p = pipeline_for(&k);
+    if (!p) return;   /* untranslatable vertex shader, or the cache is full */
 
     float vx, vy, vw, vh;
     if (c->full_viewport) { vx = vy = 0; vw = (float)g_tgt_w; vh = (float)g_tgt_h; }
@@ -977,15 +1528,36 @@ static void exec_draw(const CmdDraw *c) {
         if (vy + vh > g_tgt_h) vh = g_tgt_h - vy;
     }
     if (vw <= 0 || vh <= 0) return;
+    /* RC_SKIP_DRAWS=1 (profiling): everything but the draw itself, to tell GPU cost from the rest;
+       =2 skips only draws whose vertex shader runs on the GPU */
+    static int skip = -1;
+    if (skip < 0) skip = getenv("RC_SKIP_DRAWS") ? atoi(getenv("RC_SKIP_DRAWS")) : 0;
+    if (skip == 1 || (skip == 2 && c->key.vs)) return;
     wgpuRenderPassEncoderSetViewport(g_pass, vx, vy, vw, vh, c->minz, c->maxz);
     wgpuRenderPassEncoderSetPipeline(g_pass, p);
     uint32_t off = g_upos;
     wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 1, &off);
     wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL);   /* owned by the cache */
-    wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, g_vbuf, g_vpos, bytes);
-    wgpuRenderPassEncoderDraw(g_pass, n, 1, 0, 0);
+    if (vs_consts) {
+        memcpy(g_cstage + g_cpos, vs_consts, CSTRIDE);
+        uint32_t coff = g_cpos;
+        wgpuRenderPassEncoderSetBindGroup(g_pass, 2, g_bg_c, 1, &coff);
+        g_cpos += CSTRIDE;
+    }
+    if (gvb) {
+        wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, gvb->buf, 0, gvb->bytes);
+        wgpuRenderPassEncoderSetIndexBuffer(g_pass, g_vbuf, WGPUIndexFormat_Uint32, g_vpos, bytes);
+        wgpuRenderPassEncoderDrawIndexed(g_pass, n, 1, 0, 0, 0);
+    } else if (ibytes) {
+        wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, g_vbuf, g_vpos, bytes);
+        wgpuRenderPassEncoderSetIndexBuffer(g_pass, g_vbuf, WGPUIndexFormat_Uint32, g_vpos + bytes, ibytes);
+        wgpuRenderPassEncoderDrawIndexed(g_pass, c->nidx, 1, 0, 0, 0);
+    } else {
+        wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, g_vbuf, g_vpos, bytes);
+        wgpuRenderPassEncoderDraw(g_pass, n, 1, 0, 0);
+    }
     if (g_tgt_gs) g_tgt_gs->gpu_dirty = 1;
-    g_vpos += (bytes + 255) & ~255u;
+    g_vpos += (bytes + ibytes + 255) & ~255u;
     g_upos += USTRIDE;
 #ifndef __EMSCRIPTEN__
     if (c->capture_index >= 0) {
@@ -1006,26 +1578,29 @@ static void exec_draw(const CmdDraw *c) {
 static void pace_60hz(void) {
     static double next;
     double now = host_seconds();
-    if (next == 0 || now - next > 0.1) next = now;
     next += 1.0 / 60.0;
+    if (next < now) next = now;   /* running behind 60 Hz: never sleep, and don't try to catch up */
     if (next > now) usleep((useconds_t)((next - now) * 1e6));
 }
 #endif
 
-static void exec_present(const CmdPresent *c) {
-    begin_frame();
-    use_backbuffer();
-    if (!g_pass && !g_enc) begin_pass(1, 0, 1.f, 0);   /* nothing drawn: present black */
-    submit();
-#ifndef __EMSCRIPTEN__
-    if (c->screenshot) { char path[256]; snprintf(path, sizeof path, "/tmp/rc_frame_%u.png", c->frame); capture_png(path); }
-#else
-    (void)c;
+/* Copies the back buffer into the window and presents it: on the present thread, or inline. */
+static void present_to_window(void) {
+#ifdef __ANDROID__
+    /* blocks while the app is in the background; a new Android surface needs a new wgpu surface */
+    unsigned gen = android_present_begin();
+    if (gen != g_android_gen) {
+        if (g_pt_on) { g_pt_reconfig = 1; android_present_end(); return; }   /* the game thread swaps it */
+        g_android_gen = gen;
+        wgpuSurfaceRelease(g_surface);
+        android_create_surface();
+        configure_surface();
+    }
 #endif
-    g_frame_open = 0;
-    /* copy the back buffer to the window */
     WGPUSurfaceTexture cur = WGPU_SURFACE_TEXTURE_INIT;
+    double t_acq = host_seconds();
     wgpuSurfaceGetCurrentTexture(g_surface, &cur);
+    g_st.acquire_t += host_seconds() - t_acq;
     if (cur.status == WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal ||
         cur.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_dev, NULL);
@@ -1048,32 +1623,127 @@ static void exec_present(const CmdPresent *c) {
         WGPUExtent3D ex = { (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
         wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ex);
         WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_queue, 1, &cb);
+        queue_submit(cb);
         wgpuCommandBufferRelease(cb);
         wgpuCommandEncoderRelease(enc);
 #ifndef __EMSCRIPTEN__
+        if (g_pt_on) pt_set(2);   /* the back buffer is copied: the game thread may draw into it again */
+        double t_swap = host_seconds();
+        pthread_mutex_lock(&g_qlock);
         wgpuSurfacePresent(g_surface);   /* FIFO: waits for vsync */
+        pthread_mutex_unlock(&g_qlock);
+        g_st.swap_t += host_seconds() - t_swap;
         wgpuTextureRelease(cur.texture);
-        /* RC_PACE60: fixed 60 Hz even on fast displays, so scripted input (RC_INPUT) is repeatable */
+        /* RC_PACE60: fixed 60 Hz even on fast displays, so scripted input (RC_INPUT) is repeatable. Always
+           on Android, where 90/120 Hz panels ignore the ANativeWindow_setFrameRate hint (Galaxy A17: ~78 fps) */
         static int pace = -1;
+#ifdef __ANDROID__
+        if (pace < 0) pace = 1;
+#endif
         if (pace < 0) pace = getenv("RC_PACE60") != NULL;
+        double t_pace = host_seconds();
         if (pace) pace_60hz();
+        g_st.pace_t += host_seconds() - t_pace;
 #else
         wgpuTextureRelease(cur.texture);   /* the browser presents the canvas when this task ends */
 #endif
     } else {
         if (cur.texture) wgpuTextureRelease(cur.texture);
 #ifndef __EMSCRIPTEN__
-        if (cur.status != (WGPUSurfaceGetCurrentTextureStatus)0x00030001) configure_surface();  /* not just occluded */
+        if (cur.status != (WGPUSurfaceGetCurrentTextureStatus)0x00030001) {   /* not just occluded */
+            if (g_pt_on) g_pt_reconfig = 2; else configure_surface();
+        }
         pace_60hz();
 #endif
     }
+#ifdef __ANDROID__
+    android_present_end();
+#endif
 }
+
+#ifndef __EMSCRIPTEN__
+static void *present_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_pt_lock);
+        while (g_pt_state != 1) pthread_cond_wait(&g_pt_cond, &g_pt_lock);
+        pthread_mutex_unlock(&g_pt_lock);
+        present_to_window();
+        pt_set(0);
+    }
+    return NULL;
+}
+
+/* game thread, with the present thread idle: what it asked for (surfaces belong to the game thread,
+   since configuring one recreates the back buffer it draws into) */
+static void pt_reconfigure(void) {
+    int r = g_pt_reconfig;
+    g_pt_reconfig = 0;
+#ifdef __ANDROID__
+    if (r == 1) {
+        g_android_gen = android_present_begin();
+        wgpuSurfaceRelease(g_surface);
+        android_create_surface();
+        configure_surface();
+        android_present_end();
+        return;
+    }
+#endif
+    if (r) configure_surface();
+}
+#endif
+
+static void exec_present(const CmdPresent *c) {
+    begin_frame();
+    use_backbuffer();
+    if (!g_pass && !g_enc) begin_pass(1, 0, 1.f, 0);   /* nothing drawn: present black */
+    double t_sub = host_seconds();
+    submit();
+    g_st.submit_t += host_seconds() - t_sub;
+#ifndef __EMSCRIPTEN__
+    if (c->screenshot) { char path[256]; snprintf(path, sizeof path, "/tmp/rc_frame_%u.png", c->frame); capture_png(path); }
+#else
+    (void)c;
+#endif
+    g_frame_open = 0;
+#ifndef __EMSCRIPTEN__
+    if (g_pt_on) {
+        double t_w = host_seconds();
+        pt_wait(1);   /* the previous frame is presented (it overlapped this frame's game work) */
+        g_st.pt_wait_t += host_seconds() - t_w;
+        if (g_pt_reconfig) pt_reconfigure();
+        pt_set(1);
+        return;
+    }
+#endif
+    present_to_window();
+}
+
+#ifndef __EMSCRIPTEN__
+static void start_present_thread(void) {
+    const char *e = getenv("RC_PRESENT_THREAD");
+    if (e && !atoi(e)) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, present_thread, NULL)) return;
+    pthread_detach(t);
+    g_pt_on = 1;
+    fprintf(stderr, "[wgpu] presenting on a separate thread\n");
+}
+#endif
 
 /* ------------------------------------------------------------------ native: commands run immediately */
 
 #ifndef __EMSCRIPTEN__
+static void gpu_exec_cmd(const CmdHdr *h);
 void gpu_exec(const CmdHdr *h) {
+    int st = h->type == CMD_DRAW ? ST_DRAW : h->type == CMD_UPLOAD_TEX ? ST_UPLOAD_TEX : h->type == CMD_UPLOAD_SURF ? ST_UPLOAD_SURF
+           : h->type == CMD_READBACK ? ST_READBACK : h->type == CMD_PRESENT ? ST_PRESENT : ST_OTHER;
+    double t0 = host_seconds();
+    gpu_exec_cmd(h);
+    g_st.n[st]++;
+    g_st.t[st] += host_seconds() - t0;
+}
+static void gpu_exec_cmd(const CmdHdr *h) {
     switch (h->type) {
     case CMD_TARGET: exec_target((const CmdTarget *)h); break;
     case CMD_CLEAR: exec_clear((const CmdClear *)h); break;
@@ -1082,10 +1752,13 @@ void gpu_exec(const CmdHdr *h) {
     case CMD_DESTROY_TEX: exec_destroy(((const CmdDestroy *)h)->id, 0); break;
     case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;
     case CMD_DESTROY_SURF: exec_destroy(((const CmdDestroy *)h)->id, 1); break;
+    case CMD_UPLOAD_VB: exec_upload_vb((const CmdUploadVb *)h); break;
+    case CMD_DESTROY_VB: exec_destroy_vb(((const CmdDestroy *)h)->id); break;
     case CMD_PRESENT: exec_present((const CmdPresent *)h); break;
     case CMD_READBACK: {
         const CmdReadback *c = (const CmdReadback *)h;
         uint32_t gw, gh, stride;
+        pt_wait(1);   /* the wait below polls the device: keep the present thread out of it */
         WGPUBuffer buf = start_readback(c, &gw, &gh, &stride);
         if (buf) {
             WGPUBufferMapCallbackInfo mci = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -1158,6 +1831,8 @@ static int run_chunk(Chunk *ch) {
         case CMD_DESTROY_TEX: exec_destroy(((const CmdDestroy *)h)->id, 0); break;
         case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;
         case CMD_DESTROY_SURF: exec_destroy(((const CmdDestroy *)h)->id, 1); break;
+        case CMD_UPLOAD_VB: exec_upload_vb((const CmdUploadVb *)h); break;
+        case CMD_DESTROY_VB: exec_destroy_vb(((const CmdDestroy *)h)->id); break;
         case CMD_PRESENT: exec_present((const CmdPresent *)h); break;
         case CMD_READBACK: {
             const CmdReadback *c = (const CmdReadback *)h;

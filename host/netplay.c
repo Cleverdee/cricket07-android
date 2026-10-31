@@ -37,12 +37,14 @@
 #define NP_RING 512          /* frames of input kept per player */
 #define NP_HASH_EVERY 60
 
-typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us; } NpInput;   /* frame 0 = empty */
+typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us; int32_t mouse; } NpInput;   /* frame 0 = empty */
 /* buttons: standard-gamepad bits 0-16, plus keys the game only takes from the keyboard (pause is Esc, not
    Start): they travel with the pad and are applied to the DirectInput keyboard on every peer */
 #define NP_PAD_BITS 0x1FFFFu
 #define NP_KEY_ESC (1u << 20)
-typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t hash_lo, hash_hi; } NpMsg;
+typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t hash_lo, hash_hi; int32_t mouse; } NpMsg;
+/* mouse: dx in bits 0-11, dy in 12-23 (signed), left button in bit 24; applied on every peer like the pad */
+#define NP_MOUSE_MAX 2047
 enum { MSG_INPUT = 1, MSG_HASH = 2 };
 
 static int g_np = -1;                       /* netplay on */
@@ -51,6 +53,8 @@ static NpInput g_in[NP_SLOTS][NP_RING];
 static int g_left[NP_SLOTS];                /* peer gone: its pad reads neutral from then on */
 static NpInput g_local;                     /* latest physical/scripted state of the local pad */
 static uint32_t g_local_pressed;            /* buttons pressed since the last Present (see netplay_frame) */
+static int g_local_mdx, g_local_mdy, g_local_mbtn, g_local_mpressed;   /* the mouse, the same way */
+static volatile int g_waiting_ms;            /* how long the game has been waiting for the other player */
 static pthread_mutex_t g_local_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define OUTBOX 1024
@@ -86,6 +90,10 @@ int netplay_on(void) {
             }
             fprintf(stderr, "[netplay] %d players, local slot %d, input delay %d frames\n", g_np_players, g_np_slot,
                     g_np_delay);
+#ifdef __ANDROID__
+            extern void netplay_udp_start(int slot);
+            netplay_udp_start(g_np_slot);
+#endif
         }
     }
     return g_np;
@@ -102,6 +110,20 @@ int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t ax
     pthread_mutex_unlock(&g_local_lock);
     return 1;
 }
+
+int netplay_slot(void) { return g_np_slot; }
+void netplay_local_mouse_move(int dx, int dy) {
+    pthread_mutex_lock(&g_local_lock);
+    g_local_mdx += dx; g_local_mdy += dy;
+    pthread_mutex_unlock(&g_local_lock);
+}
+void netplay_local_mouse_button(int down) {
+    pthread_mutex_lock(&g_local_lock);
+    g_local_mbtn = down;
+    if (down) g_local_mpressed = 1;
+    pthread_mutex_unlock(&g_local_lock);
+}
+static int clamp_mouse(int v) { return v > NP_MOUSE_MAX ? NP_MOUSE_MAX : v < -NP_MOUSE_MAX ? -NP_MOUSE_MAX : v; }
 
 static void outbox_push(const NpMsg *m) {
     uint32_t w = g_out_w;
@@ -123,10 +145,11 @@ static void inputs_changed(void) {
 #endif
 }
 
-static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us) {
+static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us, int32_t mouse) {
     NpInput *e = &g_in[slot][frame % NP_RING];
     e->buttons = buttons;
     e->dt_us = dt_us;
+    e->mouse = mouse;
     for (int i = 0; i < 4; i++) e->axis[i] = axis[i];
     __atomic_store_n(&e->frame, frame, __ATOMIC_RELEASE);
 }
@@ -149,10 +172,67 @@ static void check_hash(uint32_t frame, uint64_t theirs, int slot) {
 /* Remote hashes that arrive before ours is computed wait here. */
 static struct { uint32_t frame; int slot; uint64_t hash; } g_pending[NP_SLOTS][NP_HASHES];
 
+/* Test tools. RC_NP_RECORD=<file> writes every frame's inputs and every state hash; RC_NP_REPLAY=<file> plays such a
+   file back in place of the players and compares the hashes. A repeat on the same phone shows a match depends only
+   on its inputs; the same file on another phone shows the two phones compute the same game. Both runs need the same
+   RC_NP_DELAY, RC_NP_PLAYERS and fresh saves. Records: { 1, frame, dt, per slot: buttons, axis x4, mouse } and
+   { 2, frame, hash lo, hash hi }. */
+#include <stdio.h>
+static FILE *g_rec;
+static uint32_t *g_rp, g_rp_n, g_rp_pos;     /* the replay file, in 32-bit words */
+static int g_rp_on = -1, g_rp_done;
+static uint32_t g_rp_hash_frame; static uint64_t g_rp_hash;
+static uint32_t g_rp_checked;
+static void test_tools_init(void) {
+    if (g_rp_on >= 0) return;
+    g_rp_on = 0;
+    const char *rec = getenv("RC_NP_RECORD"), *rp = getenv("RC_NP_REPLAY");
+    if (rec && !(g_rec = fopen(rec, "wb"))) perror(rec);
+    if (rp) {
+        FILE *f = fopen(rp, "rb");
+        if (!f) { perror(rp); return; }
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        g_rp = malloc((size_t)n);
+        g_rp_n = (uint32_t)fread(g_rp, 4, (size_t)n / 4, f);
+        fclose(f);
+        g_rp_on = 1;
+        fprintf(stderr, "[replay] %u words from %s\n", g_rp_n, rp);
+    }
+}
+/* reads up to and including the inputs for frame next, and the hash for the frame just shown */
+static void replay_load(uint32_t next) {
+    uint32_t words = 3 + 6 * (uint32_t)g_np_players;
+    while (g_rp_pos < g_rp_n) {
+        uint32_t *w = g_rp + g_rp_pos;
+        if (w[0] == 2) {
+            g_rp_hash_frame = w[1]; g_rp_hash = (uint64_t)w[3] << 32 | w[2];
+            g_rp_pos += 4;
+            continue;
+        }
+        if (w[1] > next) return;
+        g_rp_pos += words;
+        if (w[1] < next) continue;
+        for (int s = 0; s < g_np_players; s++) {
+            uint32_t *e = w + 3 + 6 * s;
+            store_input(s, next, e[0], (const int32_t *)(e + 1), s == 0 ? w[2] : 0, (int32_t)e[5]);
+        }
+        return;
+    }
+    if (!g_rp_done) {
+        g_rp_done = 1;
+        fprintf(stderr, "[replay] FINISHED at frame %u: %u hashes compared, %s\n", next, g_rp_checked,
+                g_desync_frame ? "MISMATCH" : "all equal");
+    }
+    static const int32_t zero[4] = { 0, 0, 0, 0 };
+    for (int s = 0; s < g_np_players; s++) store_input(s, next, 0, zero, 16667, 0);
+}
+
 /* Called at every Present on the game thread, with the frame just presented and a hash of global state. */
 void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     if (!netplay_on()) return;
     g_frame = frame;
+    test_tools_init();
+    if (g_rp_on) replay_load(frame + 1);
     /* our input for frame + D */
     NpMsg m = { MSG_INPUT, (uint32_t)g_np_slot, frame + (uint32_t)g_np_delay, 0, { 0 }, 0, 0 };
     /* A button pressed and released since the last Present still counts as held for this frame: the pad
@@ -162,6 +242,12 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     m.buttons = g_local.buttons | g_local_pressed;
     g_local_pressed = 0;
     for (int i = 0; i < 4; i++) m.axis[i] = g_local.axis[i];
+    {   /* a big move (the cursor's push to the corner) goes over several frames */
+        int mx = clamp_mouse(g_local_mdx), my = clamp_mouse(g_local_mdy);
+        g_local_mdx -= mx; g_local_mdy -= my;
+        m.mouse = (mx & 0xFFF) | ((my & 0xFFF) << 12) | ((g_local_mbtn | g_local_mpressed) << 24);
+        g_local_mpressed = 0;
+    }
     pthread_mutex_unlock(&g_local_lock);
     if (g_np_slot == 0) {   /* the host's real frame time, for the frame this input belongs to */
         static double last;
@@ -169,12 +255,12 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         double dt = last ? now - last : 1.0 / 60;
         last = now;
         if (dt < 0.004) dt = 0.004;     /* high-refresh displays present more often: still real time */
-        if (dt > 0.033) dt = 0.033;     /* a longer gap (a stall, or under 30 fps) briefly slows the game down rather
+        if (dt > 0.05) dt = 0.05;       /* a longer gap (a stall, or under 20 fps) briefly slows the game down rather
                                            than jumping ahead: a slowdown reads as "lag", a jump as broken */
         m.hash_lo = (uint32_t)(dt * 1e6);
     }
-    store_input(g_np_slot, m.frame, m.buttons, m.axis, m.hash_lo);
-    outbox_push(&m);
+    if (!g_rp_on) store_input(g_np_slot, m.frame, m.buttons, m.axis, m.hash_lo, m.mouse);
+    if (g_np_players > 1) outbox_push(&m);
     static int log_input = -1;   /* RC_NP_LOG_INPUT=1: log every non-neutral input this player sends */
     if (log_input < 0) log_input = getenv("RC_NP_LOG_INPUT") != NULL;
     if (log_input && m.buttons) fprintf(stderr, "[netplay] sent buttons %x for frame %u\n", m.buttons, m.frame);
@@ -187,7 +273,20 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         int k = (int)((frame / NP_HASH_EVERY) % NP_HASHES);
         g_my_hash[k] = h; g_my_hash_frame[k] = frame;
         NpMsg hm = { MSG_HASH, (uint32_t)g_np_slot, frame, 0, { 0 }, (uint32_t)h, (uint32_t)(h >> 32) };
-        outbox_push(&hm);
+        if (g_np_players > 1) outbox_push(&hm);
+        if (g_rec) {
+            uint32_t r[4] = { 2, frame, (uint32_t)h, (uint32_t)(h >> 32) };
+            fwrite(r, 4, 4, g_rec);
+            fflush(g_rec);
+        }
+        if (g_rp_on && g_rp_hash_frame == frame) {
+            g_rp_checked++;
+            if (g_rp_hash != h && !g_desync_frame) {
+                g_desync_frame = frame;
+                fprintf(stderr, "[replay] MISMATCH at frame %u (%016llx, recorded %016llx)\n", frame,
+                        (unsigned long long)h, (unsigned long long)g_rp_hash);
+            } else if (g_rp_checked % 10 == 0) fprintf(stderr, "[replay] frame %u: %u hashes compared\n", frame, g_rp_checked);
+        }
         for (int s = 0; s < g_np_players; s++)
             if (g_pending[s][k].frame == frame) check_hash(frame, g_pending[s][k].hash, s);
     }
@@ -206,8 +305,10 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         usleep(500);
 #endif
         double now = host_seconds();
+        g_waiting_ms = (int)((now - t0) * 1000);
         if (now - last_note > 5) { last_note = now; fprintf(stderr, "[netplay] waiting for players (frame %u, %.0f s)\n", next, now - t0); }
     }
+    g_waiting_ms = 0;
     double waited = host_seconds() - t0;
     g_wait_ms += (uint32_t)(waited * 1000);
     if (waited > 0.010) g_stalls++;
@@ -225,18 +326,41 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     static const int32_t zero[4] = { 0, 0, 0, 0 };
     extern void dinput_pad(int idx, int connected, uint32_t std_buttons, const int32_t axis[4]);
     uint32_t keys = 0;
+    int mouse_btn = 0;
+    extern void dinput_mouse_move(int dx, int dy);
+    extern void input_mouse_button_sync(int b, int down);
     for (int s = 0; s < g_np_players; s++) {
         NpInput *e = &g_in[s][next % NP_RING];
         int live = next > (uint32_t)g_np_delay && !g_left[s] && e->frame == next;
         uint32_t b = live ? e->buttons : 0;
         keys |= b;
+        if (live) {
+            int32_t mo = e->mouse;
+            int mx = (int32_t)((uint32_t)mo << 20) >> 20, my = (int32_t)((uint32_t)mo << 8) >> 20;
+            if (mx || my) dinput_mouse_move(mx, my);
+            if (mo & (1 << 24)) mouse_btn = 1;
+        }
         dinput_pad(s, 1, b & NP_PAD_BITS, live ? e->axis : zero);
+    }
+    if (g_rec) {
+        NpInput *h0 = &g_in[0][next % NP_RING];
+        uint32_t r[3] = { 1, next, next > (uint32_t)g_np_delay && !g_left[0] && h0->frame == next && h0->dt_us ? h0->dt_us : 16667 };
+        fwrite(r, 4, 3, g_rec);
+        for (int s = 0; s < g_np_players; s++) {
+            NpInput *e = &g_in[s][next % NP_RING];
+            int live = next > (uint32_t)g_np_delay && !g_left[s] && e->frame == next;
+            uint32_t o[6] = { live ? e->buttons : 0, 0, 0, 0, 0, live ? (uint32_t)e->mouse : 0 };
+            if (live) memcpy(o + 1, e->axis, 16);
+            fwrite(o, 4, 6, g_rec);
+        }
     }
     /* keyboard keys carried with the inputs: either player's Esc pauses, on every peer alike */
     extern void input_key_usage_sync(int usage, int down);
     static int esc_down;
     int esc = (keys & NP_KEY_ESC) != 0;
     if (esc != esc_down) { esc_down = esc; input_key_usage_sync(41 /* HID: Escape */, esc); }
+    static int btn_down;
+    if (mouse_btn != btn_down) { btn_down = mouse_btn; input_mouse_button_sync(0, mouse_btn); }
     /* the frame time every peer uses for the next frame: the host's (1/60 s before inputs start or if the
        host has left) */
     NpInput *h = &g_in[0][next % NP_RING];
@@ -247,24 +371,31 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
 
 /* Next outgoing message: netplay_pop() loads it (0 if none), netplay_msg(i) reads its fields: kind, slot,
    frame, buttons, axes x4, hash lo, hash hi. (Fields by call, so the transport needs no view of wasm memory.) */
-static uint32_t g_popped[10];
+static uint32_t g_popped[11];
 EXPORT int netplay_pop(void) {
     uint32_t r = g_out_r;
     if (r == __atomic_load_n(&g_out_w, __ATOMIC_ACQUIRE)) return 0;
     NpMsg *m = &g_out[r % OUTBOX];
-    uint32_t v[10] = { m->kind, m->slot, m->frame, m->buttons, (uint32_t)m->axis[0], (uint32_t)m->axis[1],
-                       (uint32_t)m->axis[2], (uint32_t)m->axis[3], m->hash_lo, m->hash_hi };
+    uint32_t v[11] = { m->kind, m->slot, m->frame, m->buttons, (uint32_t)m->axis[0], (uint32_t)m->axis[1],
+                       (uint32_t)m->axis[2], (uint32_t)m->axis[3], m->hash_lo, m->hash_hi, (uint32_t)m->mouse };
     memcpy(g_popped, v, sizeof v);
     __atomic_store_n(&g_out_r, r + 1, __ATOMIC_RELEASE);
     return 1;
 }
-EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 10 ? (int32_t)g_popped[i] : 0; }
+EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 11 ? (int32_t)g_popped[i] : 0; }
 
 EXPORT void netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry,
                                  uint32_t dt_us) {
     if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return;
     const int32_t axis[4] = { lx, ly, rx, ry };
-    store_input(slot, frame, buttons, axis, dt_us);
+    store_input(slot, frame, buttons, axis, dt_us, 0);
+    inputs_changed();
+}
+void netplay_remote_input_m(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry, uint32_t dt_us,
+                            int32_t mouse) {
+    if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return;
+    const int32_t axis[4] = { lx, ly, rx, ry };
+    store_input(slot, frame, buttons, axis, dt_us, mouse);
     inputs_changed();
 }
 
@@ -287,5 +418,7 @@ EXPORT void netplay_player_left(int slot) {
 
 /* For the page's status line: last frame, total ms spent waiting for others, first desync frame, stalls. */
 EXPORT uint32_t netplay_status(int what) {
+    if (what == 4) return (uint32_t)g_waiting_ms;
+    if (what == 5) { for (int s = 0; s < g_np_players; s++) if (s != g_np_slot && __atomic_load_n(&g_left[s], __ATOMIC_ACQUIRE)) return 1; return 0; }
     return what == 0 ? g_frame : what == 1 ? g_wait_ms : what == 2 ? g_desync_frame : g_stalls;
 }

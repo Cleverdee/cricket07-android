@@ -68,6 +68,10 @@ static void *game_main(void *arg) {
 #if defined(__EMSCRIPTEN__) && !defined(RC_NODE_BUILD)
 #include <emscripten/wasmfs.h>
 #endif
+#ifdef __ANDROID__
+#include <SDL.h>   /* renames main to SDL_main, which SDLActivity calls */
+const char *android_game_dir(void);   /* android/host/window_android.c */
+#endif
 
 int main(int argc, char **argv) {
 #if defined(__EMSCRIPTEN__) && !defined(RC_NODE_BUILD)
@@ -75,6 +79,9 @@ int main(int argc, char **argv) {
     wasmfs_create_directory("/opfs", 0777, wasmfs_create_opfs_backend());
 #endif
     const char *game = argc > 1 ? argv[1] : "game";
+#ifdef __ANDROID__
+    if (argc <= 1 && !(game = android_game_dir())) return 1;   /* app-specific storage: .../files/game */
+#endif
     if (!realpath(game, g_game_root)) { perror(game); return 1; }
     /* RC_USERDATA: another folder for saves and settings (e.g. a fresh copy per test run) */
     if (getenv("RC_USERDATA")) snprintf(g_user_root, sizeof g_user_root, "%s", getenv("RC_USERDATA"));

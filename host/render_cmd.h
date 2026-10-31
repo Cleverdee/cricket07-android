@@ -26,10 +26,11 @@ typedef struct {
     float bel[4][4];
 } Uniforms;   /* 416 bytes */
 
-typedef struct PKey { uint32_t blend, src, dst, op, zen, zwrite, zfunc, cull, cmask, topo, ps; } PKey;
+/* vs: a vertex shader handle when the shader runs on the GPU (0: vertices arrive as CVert) */
+typedef struct PKey { uint32_t blend, src, dst, op, zen, zwrite, zfunc, cull, cmask, topo, ps, vs; } PKey;
 
 enum { CMD_TARGET = 1, CMD_CLEAR, CMD_DRAW, CMD_UPLOAD_TEX, CMD_DESTROY_TEX, CMD_UPLOAD_SURF, CMD_DESTROY_SURF,
-       CMD_READBACK, CMD_PRESENT };
+       CMD_READBACK, CMD_PRESENT, CMD_UPLOAD_VB, CMD_DESTROY_VB };
 
 typedef struct { uint32_t type, size; } CmdHdr;   /* size includes the header; 8-byte aligned */
 
@@ -53,8 +54,18 @@ typedef struct {
     int32_t capture_index;    /* debugging: save the back buffer after this draw (native only); -1 none */
     Uniforms u;
     uint32_t nverts;
-    /* CVert verts[nverts] follow */
+    uint32_t vs_stride;       /* key.vs: bytes per vertex (one vec4 per input register the shader reads) */
+    uint32_t vb_id;           /* nonzero: vertices are in that cached GPU buffer (CMD_UPLOAD_VB), indexed */
+    uint32_t nidx;            /* vb_id == 0: nonzero when the draw is indexed into its own vertices */
+    /* key.vs != 0: float consts[96][4] first. Then
+       vb_id == 0: nverts vertices (CVert, or vs_stride bytes each: the shader's inputs), then nidx uint32
+                   indices into them (list topology) when nidx != 0;
+       vb_id != 0: nverts uint32 indices into the cached buffer (list topology, base vertex applied) */
 } CmdDraw;
+
+/* Vertices of a Direct3D vertex buffer that doesn't change, converted once (CVert, or a vertex shader's
+   input registers) and kept on the GPU under a new id until CMD_DESTROY_VB: `bytes` of data follow */
+typedef struct { CmdHdr h; uint32_t id, bytes; } CmdUploadVb;
 
 /* RGBA8 levels follow: for each level, w*h*4 bytes */
 /* fmt: TEXFMT_RGBA8, or a BC format whose blocks follow as stored (DXT textures, when the GPU samples BC) */

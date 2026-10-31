@@ -18,3 +18,25 @@ ghidra_project/
 .wrangler/
 node_modules/
 .claude/
+
+# Android build: your game folder and its Ghidra/translation cache
+/game/
+/work/
+/android/bundle/
+# Game data, and APKs that carry it
+*.gob
+*.big
+*.cdf
+*.apk
+*.aab
+# Test recordings
+tools/replay_*.bin
+rec*.bin
+# Private working notes, and files the builder writes
+/HANDOFF.md
+/builder_settings.txt
+/build.log
+# The builder window is the one program kept in the repository
+!/Cricket07Builder.exe
+# Team logos are their owners' trademarks: each builder supplies their own (rosters/apply_logos.py)
+/rosters/logos/

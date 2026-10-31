@@ -226,8 +226,48 @@ static uint32_t bc_format(const Texture *t) {
     return t->format == FMT_DXT1 ? TEXFMT_BC1 : t->format <= FMT_DXT3 ? TEXFMT_BC2 : TEXFMT_BC3;
 }
 
+/* ------------------------------------------------------------------ texture fingerprints
+ * What the game is doing (menus, batting, bowling, cut-scenes) shows in which HUD textures it draws. Each
+ * texture gets a hash of its level 0 contents at upload, and the hashes drawn in a frame are kept: the
+ * touch overlay picks its layout from them (gamephase.c). */
+static uint32_t tex_fingerprint(const Texture *t) {
+    uint32_t h = 2166136261u ^ t->format ^ (t->lw[0] << 8) ^ (t->lh[0] << 20);
+    uint32_t rows = t->lh[0], row = t->pitch[0];
+    if (format_is_dxt(t->format)) { rows = (t->lh[0] + 3) / 4; }
+    else if (row > t->lw[0] * 4) row = t->lw[0] * 4;
+    for (uint32_t y = 0; y < rows; y += rows > 64 ? rows / 64 : 1) {   /* up to ~64 sampled rows */
+        const uint8_t *p = HP(t->mem[0][0] + y * t->pitch[0]);
+        for (uint32_t x = 0; x < row; x += 4) { h ^= p[x] | p[x + 1] << 8 | (uint32_t)p[x + 2] << 16 | (uint32_t)p[x + 3] << 24; h *= 16777619u; }
+    }
+    return h ? h : 1;
+}
+#define FRAME_TEX_MAX 256
+static uint32_t g_frame_tex[FRAME_TEX_MAX], g_frame_tex_n;               /* this frame's fingerprints */
+static uint32_t g_frame_tex_wh[FRAME_TEX_MAX];
+/* the last full frame's; wh = width | height << 16, bit 31 of wh: drawn as 2D (pre-transformed: HUD, menus)
+   - only those say anything about the phase, 3D ones are players, kits and grounds that vary per match */
+uint32_t g_last_tex[FRAME_TEX_MAX], g_last_tex_wh[FRAME_TEX_MAX], g_last_tex_n;
+static void note_texture(const Texture *t, int hud) {
+    if (!t->content_hash) return;
+    for (uint32_t i = 0; i < g_frame_tex_n; i++)
+        if (g_frame_tex[i] == t->content_hash) { if (hud) g_frame_tex_wh[i] |= 0x80000000u; return; }
+    if (g_frame_tex_n < FRAME_TEX_MAX) {
+        g_frame_tex_wh[g_frame_tex_n] = (t->lw[0] & 0x7FFF) | t->lh[0] << 16 | (hud ? 0x80000000u : 0);
+        g_frame_tex[g_frame_tex_n++] = t->content_hash;
+    }
+}
+static void frame_textures_done(void) {
+    memcpy(g_last_tex, g_frame_tex, g_frame_tex_n * 4);
+    memcpy(g_last_tex_wh, g_frame_tex_wh, g_frame_tex_n * 4);
+    g_last_tex_n = g_frame_tex_n;
+    g_frame_tex_n = 0;
+    extern void gamephase_frame(const uint32_t *hashes, uint32_t n);
+    gamephase_frame(g_last_tex, g_last_tex_n);
+}
+
 static void sync_texture(Device *d, Texture *t) {
     if (t->sent_version == t->version) return;
+    t->content_hash = tex_fingerprint(t);
     uint32_t fmt = bc_format(t), bs = fmt == TEXFMT_BC1 ? 8 : 16;
     size_t total = 0;
     for (uint32_t l = 0; l < t->levels && l < 14; l++)
@@ -262,6 +302,170 @@ static void sync_texture(Device *d, Texture *t) {
     }
     cmd_end();
     t->sent_version = t->version;
+}
+
+/* ------------------------------------------------------------------ cached vertex buffers
+ * Most of a match is drawn from vertex buffers that never change after they are filled. Their vertices are
+ * converted once (CVert, or the input registers of a vertex shader run on the GPU) and kept on the GPU, keyed
+ * by the buffers, their versions, strides and the layout (FVF or shader); draws then send only indices.
+ * Buffers that change after being converted and DrawPrimitiveUP data keep the per-draw path (D3DUSAGE_DYNAMIC
+ * says nothing here: the game creates buffers it never rewrites with it). Entries not used for a while, or least recently used ones over the budget, are dropped.
+ * RC_VB_CACHE=0 turns it off; RC_VB_CACHE_MB sets the budget (default 64); RC_VB_CACHE_AB=N alternates it
+ * on and off every N frames (to compare screenshots of a paused game). */
+
+#define VBC_MAX_STREAMS 4
+#define VBC_CAP 4096
+#define VBC_BUCKETS 1024
+typedef struct { uint32_t layout, n; struct { uint32_t id, version, stride; } s[VBC_MAX_STREAMS]; } VbKey;
+typedef struct { VbKey k; uint32_t vb_id, bytes, last_frame; int32_t next; } VbEntry;
+static VbEntry g_vbc[VBC_CAP];
+static int32_t g_vbc_bucket[VBC_BUCKETS], g_vbc_free = -1, g_vbc_used;
+static size_t g_vbc_bytes;
+static uint32_t g_vbc_hits, g_vbc_misses, g_vbc_frame;
+/* vertices of uncached draws by reason, for the [vbcache] log */
+enum { VW_UP, VW_CPU_VS, VW_NOBUF, VW_CHANGED, VW_RANGE, VW_OTHER, VW_N };
+static uint64_t g_vbc_why[VW_N];
+
+/* set by an executor that handles CMD_UPLOAD_VB and indexed draws (render_wgpu.c) */
+__attribute__((weak)) int g_gpu_vb_cache;
+
+static uint32_t vbkey_hash(const VbKey *k) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < 2 + 3 * (size_t)k->n; i++) h = (h ^ ((const uint32_t *)k)[i]) * 16777619u;
+    return h % VBC_BUCKETS;
+}
+
+static void vbc_drop(int32_t e) {
+    VbEntry *v = &g_vbc[e];
+    for (int32_t *p = &g_vbc_bucket[vbkey_hash(&v->k)]; *p >= 0; p = &g_vbc[*p].next)
+        if (*p == e) { *p = v->next; break; }
+    CmdDestroy *c = cmd_alloc(CMD_DESTROY_VB, sizeof *c);
+    c->id = v->vb_id;
+    cmd_end();
+    g_vbc_bytes -= v->bytes;
+    v->vb_id = 0;
+    v->next = g_vbc_free;
+    g_vbc_free = e;
+}
+
+/* drops entries unused for 10 s, then least recently used ones (not this frame's) until `need` more fits */
+static void vbc_evict(size_t budget, size_t need) {
+    for (int32_t e = 0; e < g_vbc_used; e++)
+        if (g_vbc[e].vb_id && g_vbc_frame - g_vbc[e].last_frame > 600) vbc_drop(e);
+    while (g_vbc_bytes + need > budget) {
+        int32_t old = -1;
+        for (int32_t e = 0; e < g_vbc_used; e++)
+            if (g_vbc[e].vb_id && g_vbc[e].last_frame != g_vbc_frame && (old < 0 || g_vbc[e].last_frame < g_vbc[old].last_frame)) old = e;
+        if (old < 0) break;
+        vbc_drop(old);
+    }
+}
+
+/* the cached GPU buffer holding this draw's vertices (converted now if needed), or 0: use the per-draw path.
+   gpu_in: input registers of a vertex shader run on the GPU (sh set), else fixed function with FVF layout L. */
+static size_t g_vbc_budget;
+/* the cache and indexed draws are on (off: every draw sends its vertices expanded, as before them) */
+static int vbc_active(void) {
+    static int enabled = -1, ab;
+    if (enabled < 0) {
+        enabled = g_gpu_vb_cache && (!getenv("RC_VB_CACHE") || atoi(getenv("RC_VB_CACHE")));
+        g_vbc_budget = (size_t)(getenv("RC_VB_CACHE_MB") ? atoi(getenv("RC_VB_CACHE_MB")) : 64) << 20;
+        for (int i = 0; i < VBC_BUCKETS; i++) g_vbc_bucket[i] = -1;
+        /* RC_VB_CACHE_AB=N (checking): on only in every other N-frame period, to compare screenshots */
+        ab = getenv("RC_VB_CACHE_AB") ? atoi(getenv("RC_VB_CACHE_AB")) : 0;
+    }
+    return enabled && !(ab > 0 && (g_vbc_frame / (uint32_t)ab) & 1);
+}
+
+static uint32_t vbc_lookup(Device *d, Shader *sh, int gpu_in, const FvfLayout *L, uint32_t stride, const uint32_t *idx,
+                           uint32_t n) {
+    if (!vbc_active()) return 0;
+    size_t budget = g_vbc_budget;
+    const DevState *st = &d->st;
+    VbKey k;
+    memset(&k, 0, sizeof k);
+    k.layout = st->vs;
+    Buffer *bufs[VBC_MAX_STREAMS];
+    uint32_t streams[VBC_MAX_STREAMS], mask = sh ? vs_stream_mask(sh) : 1, nv = 0xFFFFFFFFu;
+    for (uint32_t s = 0; s < 16; s++) {
+        if (!(mask & (1u << s))) continue;
+        Buffer *b = com_data(st->stream_vb[s]);
+        uint32_t str = sh ? st->stream_stride[s] : stride;
+        if (!b || !str || k.n == VBC_MAX_STREAMS || b->index) { g_vbc_why[VW_NOBUF] += n; return 0; }
+        if (b->gpu_dynamic) { g_vbc_why[VW_CHANGED] += n; return 0; }
+        if (!b->gpu_id) b->gpu_id = gpu_new_id();
+        k.s[k.n].id = b->gpu_id; k.s[k.n].version = b->version; k.s[k.n].stride = str;
+        bufs[k.n] = b; streams[k.n++] = s;
+        if (b->size / str < nv) nv = b->size / str;
+    }
+    if (!k.n || !nv) { g_vbc_why[VW_OTHER] += n; return 0; }
+    for (uint32_t i = 0; i < n; i++) if (idx[i] >= nv) { g_vbc_why[VW_RANGE] += n; return 0; }
+
+    uint32_t h = vbkey_hash(&k);
+    for (int32_t e = g_vbc_bucket[h]; e >= 0; e = g_vbc[e].next)
+        if (!memcmp(&g_vbc[e].k, &k, sizeof k)) { g_vbc[e].last_frame = g_vbc_frame; g_vbc_hits++; return g_vbc[e].vb_id; }
+
+    /* a buffer that changed since it was last converted is probably rewritten as the game goes (DYNAMIC
+       usage alone says nothing: the game sets it on buffers it fills once) */
+    for (uint32_t i = 0; i < k.n; i++) {
+        Buffer *b = bufs[i];
+        if (b->gpu_converted && b->gpu_conv_version != b->version && ++b->gpu_changes >= 3) { b->gpu_dynamic = 1; g_vbc_why[VW_CHANGED] += n; return 0; }
+    }
+    uint32_t vsize = sh ? 16u * (uint32_t)gpu_in : (uint32_t)sizeof(CVert);
+    if ((uint64_t)nv * vsize > budget / 4) { g_vbc_why[VW_OTHER] += n; return 0; }
+    uint32_t bytes = nv * vsize;
+    vbc_evict(budget, bytes);
+    if (g_vbc_free < 0 && g_vbc_used == VBC_CAP) return 0;
+    g_vbc_misses++;
+    int32_t e = g_vbc_free >= 0 ? g_vbc_free : g_vbc_used++;
+    if (g_vbc_free == e) g_vbc_free = g_vbc[e].next;
+    VbEntry *v = &g_vbc[e];
+    v->k = k; v->vb_id = gpu_new_id(); v->bytes = bytes; v->last_frame = g_vbc_frame;
+    v->next = g_vbc_bucket[h];
+    g_vbc_bucket[h] = e;
+    g_vbc_bytes += bytes;
+    for (uint32_t i = 0; i < k.n; i++) { bufs[i]->gpu_converted = 1; bufs[i]->gpu_conv_version = bufs[i]->version; }
+
+    CmdUploadVb *c = cmd_alloc(CMD_UPLOAD_VB, sizeof *c + bytes);
+    c->id = v->vb_id;
+    c->bytes = bytes;
+    if (sh) {
+        VsStreams vss;
+        memset(&vss, 0, sizeof vss);
+        for (uint32_t i = 0; i < k.n; i++) { vss.data[streams[i]] = HP(bufs[i]->mem); vss.stride[streams[i]] = k.s[i].stride; }
+        static VsCtx vx;   /* large: not on the stack */
+        vs_begin(&vx, sh, (const float (*)[4])st->vs_const, &vss);
+        float *o = (float *)(c + 1);
+        for (uint32_t i = 0; i < nv; i++, o += 4 * gpu_in) vs_fetch(&vx, i, o);
+    } else {
+        const uint8_t *vb = HP(bufs[0]->mem);
+        CVert *o = (CVert *)(c + 1);
+        for (uint32_t i = 0; i < nv; i++) convert_vertex(vb + (size_t)i * stride, L, &o[i]);
+    }
+    cmd_end();
+    return v->vb_id;
+}
+
+static void vbc_end_frame(void) {
+    g_vbc_frame++;
+    static int ab = -1;
+    if (ab < 0) ab = getenv("RC_VB_CACHE_AB") ? atoi(getenv("RC_VB_CACHE_AB")) : 0;
+    if (ab > 0 && g_vbc_frame % (uint32_t)ab == 0)
+        fprintf(stderr, "[vbcache] A/B: cache %s\n", (g_vbc_frame / (uint32_t)ab) & 1 ? "off" : "on");
+    static int log = -1;
+    if (log < 0) log = getenv("RC_LOG_FPS") != NULL;
+    if (log && g_vbc_frame % 120 == 0) {
+        int32_t live = 0;
+        for (int32_t e = 0; e < g_vbc_used; e++) live += g_vbc[e].vb_id != 0;
+        fprintf(stderr, "[vbcache] %d buffers, %.1f MB; per frame: %.1f cached draws, %.2f conversions; uncached "
+                "vertices: UP %.0f, CPU VS %.0f, no buffer %.0f, changed %.0f, range %.0f, other %.0f\n", live,
+                g_vbc_bytes / 1048576.0, (g_vbc_hits + g_vbc_misses) / 120.0, g_vbc_misses / 120.0,
+                g_vbc_why[VW_UP] / 120.0, g_vbc_why[VW_CPU_VS] / 120.0, g_vbc_why[VW_NOBUF] / 120.0,
+                g_vbc_why[VW_CHANGED] / 120.0, g_vbc_why[VW_RANGE] / 120.0,
+                g_vbc_why[VW_OTHER] / 120.0);
+        g_vbc_hits = g_vbc_misses = 0;
+        memset(g_vbc_why, 0, sizeof g_vbc_why);
+    }
 }
 
 /* ------------------------------------------------------------------ clears */
@@ -379,11 +583,54 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         if (t && t->type == RT_TEXTURE && !(t->usage & 1)) sync_texture(d, t);
     }
 
-    CmdDraw *c = cmd_alloc(CMD_DRAW, sizeof *c + (size_t)n * sizeof(CVert));
+    /* Vertex shaders run on the GPU (translated to WGSL by vshader.c): here only their input registers
+       are fetched. RC_CPU_VS=1 runs them on the CPU instead, as do shaders that can't be translated. */
+    static int cpu_vs = -1;
+    if (cpu_vs < 0) cpu_vs = getenv("RC_CPU_VS") != NULL;
+    int gpu_in = sh && !cpu_vs && !(g_snap_detail && st->vs == g_trace_vs) ? vs_gpu_inputs(sh) : -1;
+    uint32_t vs_stride = gpu_in > 0 ? 16u * (uint32_t)gpu_in : 16u;
+    /* vertices from an unchanging buffer: converted once and kept on the GPU, the draw sends indices */
+    uint32_t vb_id = !vertices_up && (sh ? gpu_in > 0 : 1) ? vbc_lookup(d, sh, gpu_in, &L, stride, idx, n) : 0;
+    if (vertices_up) g_vbc_why[VW_UP] += n;
+    else if (sh && gpu_in <= 0) g_vbc_why[VW_CPU_VS] += n;
+    /* otherwise indexed meshes convert each referenced vertex once (over the referenced range) rather than
+       once per index, when that sends less */
+    uint32_t vsize = gpu_in >= 0 ? vs_stride : (uint32_t)sizeof(CVert), lo = 0, nv = n, nidx = 0;
+    if (!vb_id && indices && n && (sh ? gpu_in > 0 : 1) && vbc_active()) {
+        uint32_t l = 0xFFFFFFFFu, h = 0;
+        for (uint32_t i = 0; i < n; i++) { if (idx[i] < l) l = idx[i]; if (idx[i] > h) h = idx[i]; }
+        if ((uint64_t)(h - l + 1) * vsize + 4ull * n < (uint64_t)n * vsize) { lo = l; nv = h - l + 1; nidx = n; }
+    }
+    size_t vbytes = (gpu_in >= 0 ? sizeof(float) * 96 * 4 : 0) + (vb_id ? (size_t)n * 4 : (size_t)nv * vsize + (size_t)nidx * 4);
+    CmdDraw *c = cmd_alloc(CMD_DRAW, sizeof *c + vbytes);
     CVert *cv = (CVert *)(c + 1);
-    c->nverts = n;
+    c->nverts = vb_id ? n : nv;
+    c->nidx = nidx;
+    c->vs_stride = gpu_in >= 0 ? vs_stride : 0;
+    c->vb_id = vb_id;
     c->capture_index = g_snap_detail ? (int32_t)(g_f_drawn - 1) : -1;
-    if (sh) {
+    if (vb_id) {
+        float *consts = (float *)(c + 1);
+        if (sh) vs_constants(sh, (const float (*)[4])st->vs_const, (float (*)[4])consts);
+        memcpy(sh ? (void *)(consts + 96 * 4) : (void *)cv, idx, (size_t)n * 4);
+    } else if (sh && gpu_in >= 0) {
+        VsStreams vss;
+        memset(&vss, 0, sizeof vss);
+        if (vertices_up) { vss.data[0] = vertices_up; vss.stride[0] = up_stride; }
+        else
+            for (int s = 0; s < 16; s++) {
+                Buffer *sb = com_data(st->stream_vb[s]);
+                if (sb) { vss.data[s] = HP(sb->mem); vss.stride[s] = st->stream_stride[s]; }
+            }
+        VsCtx vx;
+        vs_begin(&vx, sh, (const float (*)[4])st->vs_const, &vss);
+        float *consts = (float *)(c + 1);
+        memcpy(consts, vx.f[VSF_CONST], sizeof(float) * 96 * 4);   /* with the shader's def values */
+        uint8_t *vout = (uint8_t *)(consts + 96 * 4);
+        if (!gpu_in) memset(vout, 0, (size_t)n * vs_stride);
+        else for (uint32_t i = 0; i < nv; i++) vs_fetch(&vx, nidx ? lo + i : idx[i], (float *)(vout + (size_t)i * vs_stride));
+        if (nidx) { uint32_t *o = (uint32_t *)(vout + (size_t)nv * vs_stride); for (uint32_t i = 0; i < n; i++) o[i] = idx[i] - lo; }
+    } else if (sh) {
         VsStreams vss;
         memset(&vss, 0, sizeof vss);
         if (vertices_up) { vss.data[0] = vertices_up; vss.stride[0] = up_stride; }
@@ -402,11 +649,13 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         uint32_t range = n ? hi - lo + 1 : 0;
         int use_range = range <= 2 * n + 64;
         CVert *tmp = use_range ? malloc(sizeof(CVert) * (range ? range : 1)) : NULL;
+        VsCtx vx;
+        vs_begin(&vx, sh, (const float (*)[4])st->vs_const, &vss);
         for (uint32_t i = 0; i < (use_range ? range : n); i++) {
             VsOut o;
             extern int vs_trace;
             vs_trace = g_snap_detail && i == 0 && st->vs == g_trace_vs;
-            vs_run(sh, (const float (*)[4])st->vs_const, &vss, use_range ? lo + i : idx[i], &o);
+            vs_exec(&vx, use_range ? lo + i : idx[i], &o);
             vs_trace = 0;
             CVert *v = use_range ? &tmp[i] : &cv[i];
             v->x = o.pos[0]; v->y = o.pos[1]; v->z = o.pos[2]; v->w = o.pos[3];
@@ -415,7 +664,8 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         }
         if (use_range) { for (uint32_t i = 0; i < n; i++) cv[i] = tmp[idx[i] - lo]; free(tmp); }
     } else {
-        for (uint32_t i = 0; i < n; i++) convert_vertex(vb + (size_t)idx[i] * stride, &L, &cv[i]);
+        for (uint32_t i = 0; i < nv; i++) convert_vertex(vb + (size_t)(nidx ? lo + i : idx[i]) * stride, &L, &cv[i]);
+        if (nidx) { uint32_t *o = (uint32_t *)(cv + nv); for (uint32_t i = 0; i < n; i++) o[i] = idx[i] - lo; }
     }
     free(idx);
 
@@ -427,6 +677,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
             if (s0) { c->slot_kind[s] = TS_RTSURF; c->slot_id[s] = s0->gpu_id; }
         } else if (t && t->type == RT_TEXTURE) {
             c->slot_kind[s] = TS_TEX; c->slot_id[s] = t->gpu_id;
+            note_texture(t, !sh && L.pos_type == 0x4);
         }
     }
     c->pixel_shader = st->ps;
@@ -474,6 +725,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
                st->rs[14], st->rs[23], st->rs[22], st->rs[168] & 0xF, topo, st->ps };
     if (L.pos_type == 0x4) k.cull = 1;  /* keep 2D simple: no culling for pre-transformed vertices */
     else if (k.cull == 2) k.cull = 3; else if (k.cull == 3) k.cull = 2;  /* D3D CW/CCW culls back/front with CW front */
+    k.vs = gpu_in >= 0 ? st->vs : 0;
     c->key = k;
     c->vp[0] = (float)st->viewport.x; c->vp[1] = (float)st->viewport.y;
     c->vp[2] = (float)(st->viewport.w ? st->viewport.w : g_tgt_lw);
@@ -502,6 +754,8 @@ static void rec_present_impl(Device *d) {
     cmd_end();
     cmd_flush(1);
     g_target_sent = 0;   /* the executor ends every frame on the back buffer */
+    vbc_end_frame();
+    frame_textures_done();
     g_f_drawn = 0;
 #ifdef __EMSCRIPTEN__
     /* Don't run ahead of the display: two frames queued (a slow frame doesn't skip a vsync). Online every

@@ -64,8 +64,8 @@ void handle_close(uint32_t h);
 
 /* ------------------------------------------------------------------ paths */
 
-extern char g_game_root[1024];   /* host folder holding the game's files */
-extern char g_user_root[1024];   /* host folder for files the game writes outside its own folder */
+extern char g_game_root[4096];   /* host folder holding the game's files */
+extern char g_user_root[4096];   /* host folder for files the game writes outside its own folder */
 #define GUEST_ROOT PROFILE_GUEST_ROOT
 
 /* Maps a Windows path from the game to a host path, matching path components case-insensitively.

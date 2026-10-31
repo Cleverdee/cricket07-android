@@ -1,24 +1,30 @@
-/* Direct3D 8 vertex shaders (vs.1.1) and vertex declarations, run on the CPU.
+/* Direct3D 8 vertex shaders (vs.1.1) and vertex declarations.
  *
- * The renderer already converts every vertex on the CPU, so programmable vertex processing is done
- * the same way: the declaration says how stream data maps onto input registers v0-v15, the shader
- * runs per vertex, and its outputs (oPos in clip space, oD0/oD1, oT0-oT7) feed the fixed-function
- * pixel stage. Each shader is decoded once into a compact instruction list. */
+ * The declaration says how stream data maps onto input registers v0-v15, the shader runs per vertex,
+ * and its outputs (oPos in clip space, oD0/oD1, oT0-oT7) feed the fixed-function pixel stage. Each
+ * shader is decoded once into a compact instruction list, which either runs here on the CPU (vs_exec)
+ * or is translated to a WGSL vertex function (vs_to_wgsl) so the GPU runs it; then the CPU only
+ * fetches the input registers (vs_fetch). */
 #include "vshader.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdlib.h>
 
 enum { RT_TEMP = 0, RT_INPUT = 1, RT_CONST = 2, RT_ADDR = 3, RT_RASTOUT = 4, RT_ATTROUT = 5, RT_TEXOUT = 6 };
 
-typedef struct { uint8_t type, rel, neg, swz[4]; uint16_t num; } Src;
-typedef struct { uint16_t op; uint8_t dtype, dmask; uint16_t dnum; uint8_t nsrc; Src s[3]; } Insn;
+/* idx: the operand's slot in the register file (VsCtx.f), resolved at decode time; for relative constant
+   addressing it is resolved per use from num + a0 */
+typedef struct { uint8_t type, rel, neg, ident, swz[4]; uint16_t num, idx; } Src;
+typedef struct { uint16_t op; uint8_t dtype, dmask; uint16_t dnum, didx; uint8_t nsrc; Src s[3]; } Insn;
 
-typedef struct {
+typedef struct VsProgram {
     Insn *code; uint32_t n;
     /* declaration: input register sources */
     struct { uint8_t used, stream, type; uint16_t offset; } in[16];
+    uint8_t used_in[16]; int nused;                /* the used input registers, in order */
     float defs[96][4]; uint8_t has_def[96];        /* constants from the declaration and `def` */
+    int any_def;
     int fixed_function;                            /* declaration without a program */
     int ok;
 } VsProgram;
@@ -66,6 +72,16 @@ static void parse_decl(VsProgram *p, const uint32_t *t, uint32_t n) {
     }
 }
 
+/* register file slot of a source register (out of range or unreadable: the zero vector) */
+static inline uint16_t src_slot(uint8_t type, int num) {
+    switch (type) {
+    case RT_TEMP: return num >= 0 && num < 12 ? (uint16_t)(VSF_TEMP + num) : VSF_ZERO;
+    case RT_INPUT: return num >= 0 && num < 16 ? (uint16_t)(VSF_IN + num) : VSF_ZERO;
+    case RT_CONST: return num >= 0 && num < 96 ? (uint16_t)(VSF_CONST + num) : VSF_ZERO;
+    default: return VSF_ZERO;
+    }
+}
+
 static Src decode_src(uint32_t t) {
     Src s;
     s.type = (uint8_t)((t >> 28) & 7);
@@ -73,7 +89,20 @@ static Src decode_src(uint32_t t) {
     s.rel = (t >> 13) & 1;
     s.neg = ((t >> 24) & 0xF) == 1;
     for (int k = 0; k < 4; k++) s.swz[k] = (uint8_t)((t >> (16 + 2 * k)) & 3);
+    s.ident = !s.neg && s.swz[0] == 0 && s.swz[1] == 1 && s.swz[2] == 2 && s.swz[3] == 3;
+    s.idx = src_slot(s.type, s.num);
     return s;
+}
+
+/* register file slot of a destination (unwritable: the dummy vector) */
+static uint16_t dst_slot(uint8_t type, uint16_t num) {
+    switch (type) {
+    case RT_TEMP: return num < 12 ? (uint16_t)(VSF_TEMP + num) : VSF_DUMMY;
+    case RT_RASTOUT: return num == 0 ? VSF_OPOS : VSF_DUMMY;
+    case RT_ATTROUT: return num < 2 ? (uint16_t)(VSF_OD + num) : VSF_DUMMY;
+    case RT_TEXOUT: return num < 8 ? (uint16_t)(VSF_OT + num) : VSF_DUMMY;
+    default: return VSF_DUMMY;
+    }
 }
 
 static int parse_code(VsProgram *p, const uint32_t *t, uint32_t n) {
@@ -98,6 +127,7 @@ static int parse_code(VsProgram *p, const uint32_t *t, uint32_t n) {
         in->dtype = (uint8_t)((d >> 28) & 7);
         in->dnum = (uint16_t)(d & 0x1FFF);
         in->dmask = (uint8_t)((d >> 16) & 0xF);
+        in->didx = dst_slot(in->dtype, in->dnum);
         in->nsrc = (uint8_t)(np - 1);
         for (int k = 0; k < np - 1; k++) {
             uint32_t s = t[i++];
@@ -115,6 +145,8 @@ static VsProgram *program_for(Shader *sh) {
     if (!sh->code) { p->fixed_function = 1; p->ok = 1; }
     else p->ok = parse_code(p, sh->code, sh->code_len);
     if (!p->ok) fprintf(stderr, "[vs] could not decode shader (version %08x)\n", sh->code ? sh->code[0] : 0);
+    for (int i = 0; i < 16; i++) if (p->in[i].used) p->used_in[p->nused++] = (uint8_t)i;
+    for (int i = 0; i < 96; i++) p->any_def |= p->has_def[i];
     if (getenv("RC_DUMP_VS")) {   /* raw tokens, for offline disassembly */
         fprintf(stderr, "[vsdump %p] decl", (void *)sh);
         for (uint32_t i = 0; i < sh->decl_len; i++) fprintf(stderr, " %08x", sh->decl[i]);
@@ -146,17 +178,13 @@ static void fetch(const uint8_t *src, uint32_t type, float *o) {
 
 /* ------------------------------------------------------------------ execution */
 
-static inline void read_src(const Src *s, float r[][4], const float v[16][4], const float c[96][4], int a0,
-                            float *o) {
-    const float *base;
-    static const float zero[4];
-    switch (s->type) {
-    case RT_TEMP: base = s->num < 12 ? r[s->num] : zero; break;
-    case RT_INPUT: base = s->num < 16 ? v[s->num] : zero; break;
-    case RT_CONST: { int i = s->num + (s->rel ? a0 : 0); base = i >= 0 && i < 96 ? c[i] : zero; break; }
-    default: base = zero; break;
-    }
-    for (int k = 0; k < 4; k++) o[k] = s->neg ? -base[s->swz[k]] : base[s->swz[k]];
+/* reads a source operand (row: register offset for the m4x4-family rows) */
+static inline void read_src(const Src *s, float (*f)[4], int a0, int row, float *o) {
+    int rel = s->rel && s->type == RT_CONST;   /* only constants are addressed through a0 */
+    const float *base = f[row || rel ? src_slot(s->type, s->num + row + (rel ? a0 : 0)) : s->idx];
+    if (s->ident) { memcpy(o, base, 16); return; }
+    if (s->neg) for (int k = 0; k < 4; k++) o[k] = -base[s->swz[k]];
+    else for (int k = 0; k < 4; k++) o[k] = base[s->swz[k]];
 }
 
 static inline float dp3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
@@ -164,14 +192,28 @@ static inline float dp4(const float *a, const float *b) { return dp3(a, b) + a[3
 
 int vs_trace;   /* set by the renderer to trace one vertex */
 
-void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t index, VsOut *out) {
+/* Once per draw: constants (with the shader's own def/declaration values over them), unused inputs. */
+void vs_begin(VsCtx *x, Shader *sh, const float consts[96][4], const VsStreams *st) {
     VsProgram *p = program_for(sh);
-    float v[16][4];
-    for (int i = 0; i < 16; i++) {
-        if (!p->in[i].used || !st->data[p->in[i].stream]) { v[i][0] = v[i][1] = v[i][2] = 0; v[i][3] = 1; continue; }
-        const uint8_t *src = st->data[p->in[i].stream] + (size_t)index * st->stride[p->in[i].stream] + p->in[i].offset;
-        fetch(src, p->in[i].type, v[i]);
+    x->p = p;
+    x->st = st;
+    memcpy(x->f[VSF_CONST], consts, sizeof(float) * 96 * 4);
+    if (p->any_def) for (int i = 0; i < 96; i++) if (p->has_def[i]) memcpy(x->f[VSF_CONST + i], p->defs[i], 16);
+    memset(x->f[VSF_ZERO], 0, 16);
+    for (int i = 0; i < 16; i++) { float *v = x->f[VSF_IN + i]; v[0] = v[1] = v[2] = 0; v[3] = 1; }
+}
+
+void vs_exec(VsCtx *x, uint32_t index, VsOut *out) {
+    VsProgram *p = x->p;
+    const VsStreams *st = x->st;
+    float (*f)[4] = x->f;
+    for (int u = 0; u < p->nused; u++) {
+        int i = p->used_in[u];
+        const uint8_t *data = st->data[p->in[i].stream];
+        if (!data) continue;   /* stays (0, 0, 0, 1) */
+        fetch(data + (size_t)index * st->stride[p->in[i].stream] + p->in[i].offset, p->in[i].type, f[VSF_IN + i]);
     }
+    const float (*v)[4] = (const float (*)[4])f[VSF_IN];
     if (p->fixed_function) {
         /* declaration-only shader: D3D's fixed register mapping (v0 position, v5/v6 colors, v7+ texcoords) */
         const float *m = st->ff_mvp;
@@ -186,27 +228,19 @@ void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t
 
     /* constants: declaration/def values override nothing set later by SetVertexShaderConstant, but D3D
        applies declaration constants at SetVertexShader time; using them as a base is close enough */
-    float r[12][4] = { { 0 } };
-    float o_pos[4] = { 0, 0, 0, 1 }, o_d[2][4] = { { 1, 1, 1, 1 }, { 0, 0, 0, 0 } }, o_t[8][4];
-    for (int t = 0; t < 8; t++) { o_t[t][0] = o_t[t][1] = o_t[t][2] = 0; o_t[t][3] = 1; }
-    float dummy[4];
+    memset(f[VSF_TEMP], 0, sizeof(float) * 12 * 4);
+    static const float out_init[11][4] = { { 0, 0, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 },
+                                           { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 },
+                                           { 0, 0, 0, 1 } };   /* oPos, oD0, oD1, oT0-oT7 */
+    memcpy(f[VSF_OPOS], out_init, sizeof out_init);
     int a0 = 0;
-    const float (*c)[4] = consts;
-    float cbuf[96][4];
-    int any_def = 0;
-    for (int i = 0; i < 96 && !any_def; i++) any_def = p->has_def[i];
-    if (any_def) {
-        memcpy(cbuf, consts, sizeof cbuf);
-        for (int i = 0; i < 96; i++) if (p->has_def[i]) memcpy(cbuf[i], p->defs[i], 16);
-        c = (const float (*)[4])cbuf;
-    }
 
     for (uint32_t i = 0; i < p->n; i++) {
         const Insn *in = &p->code[i];
         float s0[4], s1[4], s2[4], res[4] = { 0, 0, 0, 0 };
-        if (in->nsrc > 0) read_src(&in->s[0], r, (const float (*)[4])v, c, a0, s0);
-        if (in->nsrc > 1) read_src(&in->s[1], r, (const float (*)[4])v, c, a0, s1);
-        if (in->nsrc > 2) read_src(&in->s[2], r, (const float (*)[4])v, c, a0, s2);
+        if (in->nsrc > 0) read_src(&in->s[0], f, a0, 0, s0);
+        if (in->nsrc > 1) read_src(&in->s[1], f, a0, 0, s1);
+        if (in->nsrc > 2) read_src(&in->s[2], f, a0, 0, s2);
         switch (in->op) {
         case 1: memcpy(res, s0, 16); break;                                          /* mov */
         case 2: for (int k = 0; k < 4; k++) res[k] = s0[k] + s1[k]; break;          /* add */
@@ -238,12 +272,11 @@ void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t
         case 19: for (int k = 0; k < 4; k++) res[k] = s0[k] - floorf(s0[k]); break;           /* frc */
         case 20: case 21: case 22: case 23: case 24: {                               /* m4x4 m4x3 m3x4 m3x3 m3x2 */
             int rows = in->op == 20 || in->op == 22 ? 4 : in->op == 24 ? 2 : 3, four = in->op <= 21;
-            Src row = in->s[1];
-            for (int k = 0; k < rows; k++) {
+            res[0] = four ? dp4(s0, s1) : dp3(s0, s1);   /* row 0 is s1 itself */
+            for (int k = 1; k < rows; k++) {
                 float m[4];
-                read_src(&row, r, (const float (*)[4])v, c, a0, m);
+                read_src(&in->s[1], f, a0, k, m);
                 res[k] = four ? dp4(s0, m) : dp3(s0, m);
-                row.num++;
             }
             break;
         }
@@ -255,19 +288,15 @@ void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t
                    res[3] = 1; break; }
         default: break;
         }
-        float *dst;
-        switch (in->dtype) {
-        case RT_TEMP: dst = in->dnum < 12 ? r[in->dnum] : dummy; break;
-        case RT_ADDR: if (in->dmask & 1) a0 = (int)floorf(res[0]); continue;
-        case RT_RASTOUT: dst = in->dnum == 0 ? o_pos : dummy; break;
-        case RT_ATTROUT: dst = in->dnum < 2 ? o_d[in->dnum] : dummy; break;
-        case RT_TEXOUT: dst = in->dnum < 8 ? o_t[in->dnum] : dummy; break;
-        default: dst = dummy; break;
-        }
-        for (int k = 0; k < 4; k++) if (in->dmask & (1 << k)) dst[k] = res[k];
+        if (in->dtype == RT_ADDR) { if (in->dmask & 1) a0 = (int)floorf(res[0]); continue; }
+        float *dst = f[in->didx];
+        if (in->dmask == 0xF) memcpy(dst, res, 16);
+        else for (int k = 0; k < 4; k++) if (in->dmask & (1 << k)) dst[k] = res[k];
     }
     if (vs_trace) {
-        fprintf(stderr, "[vstrace %p] idx %u\n", (void *)sh, index);
+        const float (*r)[4] = (const float (*)[4])f[VSF_TEMP], (*c)[4] = (const float (*)[4])f[VSF_CONST];
+        const float *o_pos = f[VSF_OPOS], (*o_d)[4] = (const float (*)[4])f[VSF_OD], (*o_t)[4] = (const float (*)[4])f[VSF_OT];
+        fprintf(stderr, "[vstrace %p] idx %u\n", (void *)p, index);
         for (int k = 0; k < 16; k++) if (p->in[k].used)
             fprintf(stderr, "  v%d = %g %g %g %g\n", k, v[k][0], v[k][1], v[k][2], v[k][3]);
         for (int k = 0; k < 12; k++) fprintf(stderr, "  r%d = %g %g %g %g\n", k, r[k][0], r[k][1], r[k][2], r[k][3]);
@@ -277,8 +306,167 @@ void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t
         for (int k = 0; k < 96; k++)
             fprintf(stderr, "  c%d = %g %g %g %g\n", k, c[k][0], c[k][1], c[k][2], c[k][3]);
     }
-    memcpy(out->pos, o_pos, 16);
-    memcpy(out->d0, o_d[0], 16);
-    memcpy(out->d1, o_d[1], 16);
-    for (int t = 0; t < 4; t++) memcpy(out->tex[t], o_t[t], 16);
+    memcpy(out->pos, f[VSF_OPOS], 16);
+    memcpy(out->d0, f[VSF_OD], 16);
+    memcpy(out->d1, f[VSF_OD + 1], 16);
+    memcpy(out->tex, f[VSF_OT], 4 * 16);
+}
+
+/* one vertex on its own (sets the draw up each time: callers with many vertices use vs_begin/vs_exec) */
+void vs_run(Shader *sh, const float consts[96][4], const VsStreams *st, uint32_t index, VsOut *out) {
+    static VsCtx x;   /* large: not on the stack */
+    vs_begin(&x, sh, consts, st);
+    vs_exec(&x, index, out);
+}
+
+/* ------------------------------------------------------------------ on the GPU */
+
+int vs_gpu_inputs(Shader *sh) {
+    VsProgram *p = program_for(sh);
+    return p->ok && !p->fixed_function ? p->nused : -1;
+}
+
+uint32_t vs_stream_mask(Shader *sh) {
+    VsProgram *p = program_for(sh);
+    uint32_t m = 0;
+    for (int u = 0; u < p->nused; u++) m |= 1u << p->in[p->used_in[u]].stream;
+    return m;
+}
+
+void vs_constants(Shader *sh, const float consts[96][4], float out[96][4]) {
+    VsProgram *p = program_for(sh);
+    memcpy(out, consts, sizeof(float) * 96 * 4);
+    if (p->any_def) for (int i = 0; i < 96; i++) if (p->has_def[i]) memcpy(out[i], p->defs[i], 16);
+}
+
+/* the input registers the shader reads, as vec4s in used_in order (the GPU vertex layout) */
+void vs_fetch(VsCtx *x, uint32_t index, float *o) {
+    VsProgram *p = x->p;
+    const VsStreams *st = x->st;
+    for (int u = 0; u < p->nused; u++, o += 4) {
+        int i = p->used_in[u];
+        const uint8_t *data = st->data[p->in[i].stream];
+        if (!data) { o[0] = o[1] = o[2] = 0; o[3] = 1; continue; }
+        fetch(data + (size_t)index * st->stride[p->in[i].stream] + p->in[i].offset, p->in[i].type, o);
+    }
+}
+
+typedef struct { char *s; size_t n, cap; } Str;
+static void put(Str *b, const char *fmt, ...) {
+    va_list ap;
+    for (;;) {
+        va_start(ap, fmt);
+        int k = vsnprintf(b->s ? b->s + b->n : NULL, b->s ? b->cap - b->n : 0, fmt, ap);
+        va_end(ap);
+        if (k >= 0 && b->s && b->n + (size_t)k < b->cap) { b->n += (size_t)k; return; }
+        b->cap = (b->cap + (size_t)(k > 0 ? k : 0)) * 2 + 4096;
+        b->s = realloc(b->s, b->cap);
+    }
+}
+
+/* a source operand as a WGSL vec4 expression (row: register offset for the m4x4-family rows) */
+static void src_expr(Str *b, const Src *s, int row) {
+    char base[48];
+    int num = s->num + row;
+    switch (s->type) {
+    case RT_TEMP: if (num < 12) snprintf(base, sizeof base, "r[%d]", num); else strcpy(base, "vec4<f32>(0.0)"); break;
+    case RT_INPUT: if (num < 16) snprintf(base, sizeof base, "v%d", num); else strcpy(base, "vec4<f32>(0.0)"); break;
+    case RT_CONST:
+        if (s->rel) snprintf(base, sizeof base, "cst(%d + a0)", num);
+        else if (num < 96) snprintf(base, sizeof base, "vc.c[%d]", num);
+        else strcpy(base, "vec4<f32>(0.0)");
+        break;
+    default: strcpy(base, "vec4<f32>(0.0)"); break;
+    }
+    static const char xyzw[] = "xyzw";
+    char sw[6] = ".";
+    if (s->swz[0] == 0 && s->swz[1] == 1 && s->swz[2] == 2 && s->swz[3] == 3) sw[0] = 0;
+    else for (int k = 0; k < 4; k++) sw[1 + k] = xyzw[s->swz[k]];
+    put(b, s->neg ? "(-(%s%s))" : "(%s%s)", base, sw);
+}
+
+/* WGSL for the vertex stage: entry point "vsp", inputs @location(0..nused-1) = the used v registers in
+   order, constants in @group(2) (vc.c[96]). Outputs match the fixed-function vertex stage's VO, with the
+   same half-pixel offset and color saturation as the CPU path. NULL if the shader can't run on the GPU. */
+char *vs_to_wgsl(Shader *sh) {
+    VsProgram *p = program_for(sh);
+    if (!p->ok || p->fixed_function) return NULL;
+    Str b = { 0 };
+    put(&b, "struct VC { c: array<vec4<f32>, 96> };\n@group(2) @binding(0) var<uniform> vc: VC;\n"
+            "fn cst(i: i32) -> vec4<f32> { if (i < 0 || i >= 96) { return vec4<f32>(0.0); } return vc.c[i]; }\n"
+            "fn rcp1(x: f32) -> f32 { if (x == 1.0) { return 1.0; } return 1.0 / x; }\n"
+            "fn rsq1(x: f32) -> f32 { let a = abs(x); if (a == 1.0) { return 1.0; } return inverseSqrt(a); }\n"
+            "struct VSI {");
+    for (int u = 0; u < p->nused; u++) put(&b, "%s @location(%d) v%d: vec4<f32>", u ? "," : "", u, p->used_in[u]);
+    if (!p->nused) put(&b, " @builtin(vertex_index) vid: u32");
+    put(&b, " };\n@vertex fn vsp(vi: VSI) -> VO {\n");
+    for (int i = 0; i < 16; i++) {
+        if (p->in[i].used) put(&b, "  let v%d = vi.v%d;\n", i, i);
+        else put(&b, "  let v%d = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n", i);
+    }
+    put(&b, "  var r: array<vec4<f32>, 12>;\n  var a0: i32 = 0;\n  var dummy: vec4<f32>;\n"
+            "  var opos = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n  var od: array<vec4<f32>, 2>;\n  od[0] = vec4<f32>(1.0);\n"
+            "  var ot: array<vec4<f32>, 8>;\n  for (var k = 0; k < 8; k++) { ot[k] = vec4<f32>(0.0, 0.0, 0.0, 1.0); }\n");
+    for (uint32_t i = 0; i < p->n; i++) {
+        const Insn *in = &p->code[i];
+        put(&b, "  {\n");
+        for (int k = 0; k < in->nsrc; k++) { put(&b, "    let s%d = ", k); src_expr(&b, &in->s[k], 0); put(&b, ";\n"); }
+        put(&b, "    var res = vec4<f32>(0.0);\n");
+        switch (in->op) {
+        case 1: put(&b, "    res = s0;\n"); break;
+        case 2: put(&b, "    res = s0 + s1;\n"); break;
+        case 3: put(&b, "    res = s0 - s1;\n"); break;
+        case 4: put(&b, "    res = s0 * s1 + s2;\n"); break;
+        case 5: put(&b, "    res = s0 * s1;\n"); break;
+        case 6: put(&b, "    res = vec4<f32>(rcp1(s0.w));\n"); break;
+        case 7: put(&b, "    res = vec4<f32>(rsq1(s0.w));\n"); break;
+        case 8: put(&b, "    res = vec4<f32>(dot(s0.xyz, s1.xyz));\n"); break;
+        case 9: put(&b, "    res = vec4<f32>(dot(s0, s1));\n"); break;
+        case 10: put(&b, "    res = select(s1, s0, s0 < s1);\n"); break;
+        case 11: put(&b, "    res = select(s1, s0, s0 >= s1);\n"); break;
+        case 12: put(&b, "    res = select(vec4<f32>(0.0), vec4<f32>(1.0), s0 < s1);\n"); break;
+        case 13: put(&b, "    res = select(vec4<f32>(0.0), vec4<f32>(1.0), s0 >= s1);\n"); break;
+        case 14: put(&b, "    res = vec4<f32>(exp2(s0.w));\n"); break;
+        case 15: put(&b, "    res = vec4<f32>(log2(abs(s0.w)));\n"); break;
+        case 16: put(&b, "    let pw = clamp(s0.w, -128.0, 128.0);\n"
+                         "    res = vec4<f32>(1.0, max(s0.x, 0.0), select(0.0, pow(s0.y, pw), s0.x > 0.0 && s0.y > 0.0), 1.0);\n");
+                 break;
+        case 17: put(&b, "    res = vec4<f32>(1.0, s0.y * s1.y, s0.z, s1.w);\n"); break;
+        case 18: put(&b, "    res = s0 * (s1 - s2) + s2;\n"); break;
+        case 19: put(&b, "    res = s0 - floor(s0);\n"); break;
+        case 20: case 21: case 22: case 23: case 24: {
+            int rows = in->op == 20 || in->op == 22 ? 4 : in->op == 24 ? 2 : 3, four = in->op <= 21;
+            for (int k = 0; k < rows; k++) {
+                put(&b, "    res.%c = dot(s0%s, ", "xyzw"[k], four ? "" : ".xyz");
+                src_expr(&b, &in->s[1], k);
+                put(&b, "%s);\n", four ? "" : ".xyz");
+            }
+            break;
+        }
+        case 78: put(&b, "    let w = s0.w; let fw = floor(w);\n    res = vec4<f32>(exp2(fw), w - fw, exp2(w), 1.0);\n"); break;
+        case 79: put(&b, "    let x = abs(s0.w); let e = floor(log2(x));\n"
+                         "    res = vec4<f32>(e, x / exp2(e), log2(x), 1.0);\n"); break;
+        default: break;
+        }
+        if (in->dtype == RT_ADDR) {
+            if (in->dmask & 1) put(&b, "    a0 = i32(floor(res.x));\n");
+        } else {
+            char dst[24];
+            switch (in->didx >= VSF_OT && in->didx < VSF_OT + 8 ? -1 : (int)in->didx) {
+            case -1: snprintf(dst, sizeof dst, "ot[%d]", in->didx - VSF_OT); break;
+            case VSF_OPOS: strcpy(dst, "opos"); break;
+            case VSF_OD: strcpy(dst, "od[0]"); break;
+            case VSF_OD + 1: strcpy(dst, "od[1]"); break;
+            case VSF_DUMMY: strcpy(dst, "dummy"); break;
+            default: snprintf(dst, sizeof dst, "r[%d]", in->didx - VSF_TEMP); break;
+            }
+            if (in->dmask == 0xF) put(&b, "    %s = res;\n", dst);
+            else for (int k = 0; k < 4; k++) if (in->dmask & (1 << k)) put(&b, "    %s.%c = res.%c;\n", dst, "xyzw"[k], "xyzw"[k]);
+        }
+        put(&b, "  }\n");
+    }
+    put(&b, "  var o: VO;\n  var q = opos;\n  q.x = q.x + q.w / u.vp.z;\n  q.y = q.y - q.w / u.vp.w;\n  o.pos = q;\n"
+            "  o.diffuse = saturate(od[0]);\n  o.specular = saturate(od[1]);\n"
+            "  o.tc0 = ot[0]; o.tc1 = ot[1]; o.tc2 = ot[2]; o.tc3 = ot[3];\n  return o;\n}\n");
+    return b.s;
 }

@@ -1,0 +1,431 @@
+{
+ "Chennai Super Kings": {
+  "primary": [
+   250,
+   190,
+   20
+  ],
+  "secondary": [
+   0,
+   60,
+   125
+  ],
+  "lettering": "#003C7D"
+ },
+ "Delhi Capitals": {
+  "primary": [
+   0,
+   70,
+   170
+  ],
+  "secondary": [
+   225,
+   30,
+   40
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Gujarat Titans": {
+  "primary": [
+   27,
+   40,
+   70
+  ],
+  "secondary": [
+   190,
+   155,
+   85
+  ],
+  "lettering": "#C9A85C"
+ },
+ "Kolkata Knight Riders": {
+  "primary": [
+   58,
+   34,
+   110
+  ],
+  "secondary": [
+   235,
+   185,
+   60
+  ],
+  "lettering": "#EBB93C"
+ },
+ "Lucknow Super Giants": {
+  "primary": [
+   30,
+   110,
+   190
+  ],
+  "secondary": [
+   235,
+   110,
+   40
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Mumbai Indians": {
+  "primary": [
+   0,
+   75,
+   160
+  ],
+  "secondary": [
+   205,
+   165,
+   55
+  ],
+  "lettering": "#D9B44A"
+ },
+ "Punjab Kings": {
+  "primary": [
+   215,
+   30,
+   45
+  ],
+  "secondary": [
+   175,
+   175,
+   185
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Rajasthan Royals": {
+  "primary": [
+   230,
+   30,
+   135
+  ],
+  "secondary": [
+   35,
+   70,
+   160
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Royal Challengers Bengaluru": {
+  "primary": [
+   200,
+   20,
+   45
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#E8C050"
+ },
+ "Sunrisers Hyderabad": {
+  "primary": [
+   240,
+   100,
+   35
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#000000"
+ },
+ "Hyderabad Kingsmen": {
+  "primary": [
+   20,
+   120,
+   120
+  ],
+  "secondary": [
+   230,
+   180,
+   50
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Islamabad United": {
+  "primary": [
+   215,
+   35,
+   45
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Karachi Kings": {
+  "primary": [
+   0,
+   80,
+   165
+  ],
+  "secondary": [
+   215,
+   35,
+   45
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Lahore Qalandars": {
+  "primary": [
+   0,
+   135,
+   75
+  ],
+  "secondary": [
+   215,
+   35,
+   45
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Multan Sultans": {
+  "primary": [
+   0,
+   145,
+   125
+  ],
+  "secondary": [
+   215,
+   170,
+   60
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Peshawar Zalmi": {
+  "primary": [
+   250,
+   200,
+   30
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#000000"
+ },
+ "Quetta Gladiators": {
+  "primary": [
+   95,
+   50,
+   145
+  ],
+  "secondary": [
+   235,
+   185,
+   60
+  ],
+  "lettering": "#EBB93C"
+ },
+ "Rawalpindiz": {
+  "primary": [
+   180,
+   30,
+   50
+  ],
+  "secondary": [
+   25,
+   45,
+   110
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Adelaide Strikers": {
+  "primary": [
+   0,
+   105,
+   190
+  ],
+  "secondary": [
+   30,
+   30,
+   60
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Brisbane Heat": {
+  "primary": [
+   0,
+   170,
+   175
+  ],
+  "secondary": [
+   240,
+   120,
+   40
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Hobart Hurricanes": {
+  "primary": [
+   95,
+   45,
+   150
+  ],
+  "secondary": [
+   40,
+   20,
+   70
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Melbourne Renegades": {
+  "primary": [
+   215,
+   30,
+   45
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Melbourne Stars": {
+  "primary": [
+   0,
+   160,
+   85
+  ],
+  "secondary": [
+   10,
+   70,
+   50
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Perth Scorchers": {
+  "primary": [
+   240,
+   110,
+   30
+  ],
+  "secondary": [
+   40,
+   30,
+   30
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Sydney Sixers": {
+  "primary": [
+   230,
+   35,
+   135
+  ],
+  "secondary": [
+   40,
+   30,
+   60
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Sydney Thunder": {
+  "primary": [
+   170,
+   215,
+   45
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#000000"
+ },
+ "Antigua & Barbuda Falcons": {
+  "primary": [
+   35,
+   35,
+   40
+  ],
+  "secondary": [
+   215,
+   170,
+   60
+  ],
+  "lettering": "#D9B44A"
+ },
+ "Barbados Tridents": {
+  "primary": [
+   0,
+   70,
+   150
+  ],
+  "secondary": [
+   240,
+   195,
+   40
+  ],
+  "lettering": "#F0C328"
+ },
+ "Guyana Amazon Warriors": {
+  "primary": [
+   0,
+   140,
+   80
+  ],
+  "secondary": [
+   240,
+   190,
+   40
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Jamaica Kingsmen": {
+  "primary": [
+   25,
+   25,
+   25
+  ],
+  "secondary": [
+   0,
+   140,
+   70
+  ],
+  "lettering": "#F0C328"
+ },
+ "St Kitts & Nevis Patriots": {
+  "primary": [
+   200,
+   30,
+   50
+  ],
+  "secondary": [
+   0,
+   120,
+   70
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Saint Lucia Kings": {
+  "primary": [
+   30,
+   80,
+   170
+  ],
+  "secondary": [
+   220,
+   40,
+   50
+  ],
+  "lettering": "#FFFFFF"
+ },
+ "Trinbago Knight Riders": {
+  "primary": [
+   205,
+   20,
+   40
+  ],
+  "secondary": [
+   25,
+   25,
+   25
+  ],
+  "lettering": "#E8C050"
+ }
+}
