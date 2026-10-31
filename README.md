@@ -8,6 +8,7 @@ recompilation, not an emulator: the game's code is translated to C and compiled 
 ## What you get
 
 - Touch controls that change with what's happening (batting, bowling, fielding, menus), plus a classic controller layout
+- Batting: choose your shot on the stick without moving the batsman, using separate move buttons (or joystick only, in settings)
 - Physical controller support
 - 2026 teams (optional): national sides, English counties, IPL, PSL, Big Bash and CPL, with ratings worked out from player stats
 - Local multiplayer: two phones on the same Wi-Fi or hotspot

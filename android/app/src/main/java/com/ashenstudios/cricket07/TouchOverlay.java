@@ -25,6 +25,11 @@ import android.view.View;
    and a choice between these dynamic controls and a classic controller (every pad button on screen at once,
    for anyone the dynamic switching doesn't suit).
 
+   Batting: the game moves the batsman while the stick is held left or right, so choosing a shot early walks him
+   across the crease. With move buttons on (saved as "move_buttons", the default), the stick's left and right only
+   reach the game once a shot is played, in the same report as the button, and two buttons move the batsman. Off,
+   the stick does both, as on a real controller.
+
    Bits are the W3C standard layout used by host/input.c. The game sees a "Logitech Dual Action": A = its
    bottom button (Cross), B = right (Circle), X = left (Square), Y = top (Triangle), LB/RB = L1/R1.
    Game actions, from its controller settings screens and loading tips: batting Y shot, A second shot,
@@ -57,7 +62,7 @@ public class TouchOverlay extends View {
             I_PAUSE = 17, I_GEAR = 18, I_NUMBER = 19, I_CROSS = 20, I_CIRCLE = 21, I_SQUARE = 22, I_TRIANGLE = 23,
             I_LEFT = 24, I_RIGHT = 25;
     static final int F_TOGGLE = 1, F_SHOT = 2, F_DELIVERY = 4, F_SETTINGS = 8, F_ESCAPE = 16, F_FIELD_OPEN = 32,
-                     F_FIELD_CLOSE = 64;
+                     F_FIELD_CLOSE = 64, F_MOVE_LEFT = 128, F_MOVE_RIGHT = 256;
 
     /* A button. Default place: xu/yu layout units (a ninth of the screen height) from the left or right edge
        and from the bottom; ru its radius in units. x, y, r: where it is now, in pixels. */
@@ -83,7 +88,9 @@ public class TouchOverlay extends View {
           R("charge", "Charge", I_RUN, B, F_SHOT, 1.55f, 3.55f, 0.55f),
           R("leave", "Leave", I_HAND, X, 0, 3.3f, 1.45f, 0.55f),
           R("shot2", "Shot 2", I_BAT, A, F_SHOT, 3.2f, 3.2f, 0.45f),
-          Lf("loft", "Loft", I_LOFT, LB, F_TOGGLE, 1.35f, 5.1f, 0.58f) },
+          Lf("loft", "Loft", I_LOFT, LB, F_TOGGLE, 1.35f, 5.1f, 0.58f),
+          R("mleft", "Left", I_LEFT, -1, F_MOVE_LEFT, 2.5f, 5.4f, 0.55f),
+          R("mright", "Right", I_RIGHT, -1, F_MOVE_RIGHT, 1.1f, 5.4f, 0.55f) },
         { /* running */ R("run", "Run", I_RUN, B, 0, 1.65f, 1.65f, 0.9f), R("stop", "Stop", I_HAND, A, 0, 3.45f, 1.45f, 0.62f),
           R("dive", "Dive", I_DIVE, Y, 0, 1.6f, 3.7f, 0.52f) },
         { /* bowling: choose - the game's delivery panel order, top to bottom */
@@ -113,8 +120,10 @@ public class TouchOverlay extends View {
         Lf("pause", "", I_PAUSE, -1, F_ESCAPE, 0.85f, 8.15f, 0.42f), Lf("edit", "", I_GEAR, -1, F_SETTINGS, 2.0f, 8.15f, 0.36f),
     };
     private boolean mClassic;     /* the classic controller instead of the dynamic layouts (saved as "classic") */
+    private boolean mMoveButtons; /* batting: separate buttons move the batsman (see the top of this file) */
     private boolean mSettings;    /* the settings panel is open */
-    private final RectF mSetDynamic = new RectF(), mSetClassic = new RectF(), mSetEdit = new RectF(), mSetClose = new RectF();
+    private final RectF mSetDynamic = new RectF(), mSetClassic = new RectF(), mSetEdit = new RectF(), mSetClose = new RectF(),
+                        mSetMoveOn = new RectF(), mSetMoveOff = new RectF();
 
     private int mLayout = L_MENU, mPhase = -1;
     private boolean mShotPlayed, mFieldPreview;
@@ -154,6 +163,7 @@ public class TouchOverlay extends View {
         mDp = context.getResources().getDisplayMetrics().density;
         mPrefs = context.getSharedPreferences("touch_layout", Context.MODE_PRIVATE);
         mClassic = mPrefs.getBoolean("classic", false);
+        mMoveButtons = mPrefs.getBoolean("move_buttons", true);
         if (mClassic) mLayout = L_PAD;
         mLine.setStyle(Paint.Style.STROKE);
         mIcon.setStyle(Paint.Style.STROKE);
@@ -281,11 +291,13 @@ public class TouchOverlay extends View {
         mPrefs.edit().putString(key, (b.x / getWidth()) + "," + (b.y / getHeight()) + "," + (b.r / mU)).apply();
     }
 
+    private boolean shown(Btn b) { return mMoveButtons || (b.flags & (F_MOVE_LEFT | F_MOVE_RIGHT)) == 0; }
+
     private boolean isGlobal(Btn b) { for (Btn g : mGlobal) if (g == b) return true; return false; }
 
     private Btn buttonAt(int l, float x, float y) {
         for (Btn b : mGlobal) if (b.hit(x, y)) return b;
-        for (Btn b : mLayouts[l]) if (b.hit(x, y)) return b;
+        for (Btn b : mLayouts[l]) if (shown(b) && b.hit(x, y)) return b;
         return null;
     }
 
@@ -472,6 +484,13 @@ public class TouchOverlay extends View {
                 ly = stickAxis(dy);   /* +y = down, as in the standard layout */
             }
         }
+        if (mLayout == L_BAT && mMoveButtons && !mShotPlayed && !off) {
+            lx = 0;                   /* the shot choice waits for the shot; only the buttons move the batsman */
+            for (Btn b : mLayouts[L_BAT]) {
+                if ((b.flags & F_MOVE_LEFT) != 0 && isHeld(b)) lx -= 32767;
+                if ((b.flags & F_MOVE_RIGHT) != 0 && isHeld(b)) lx += 32767;
+            }
+        }
         if (buttons == mSentButtons && lx == mSentX && ly == mSentY) return;
         mSentButtons = buttons; mSentX = lx; mSentY = ly;
         nativeTouchPad(buttons, lx, ly);
@@ -493,6 +512,8 @@ public class TouchOverlay extends View {
         float x = e.getX(), y = e.getY();
         if (mSetDynamic.contains(x, y)) setClassic(false);
         else if (mSetClassic.contains(x, y)) setClassic(true);
+        else if (!mClassic && mSetMoveOn.contains(x, y)) setMoveButtons(true);
+        else if (!mClassic && mSetMoveOff.contains(x, y)) setMoveButtons(false);
         else if (mSetEdit.contains(x, y)) { mSettings = false; enterEdit(); }
         else if (mSetClose.contains(x, y)) { mSettings = false; send(); }
         invalidate();
@@ -503,6 +524,11 @@ public class TouchOverlay extends View {
         mClassic = on;
         mPrefs.edit().putBoolean("classic", on).apply();
         setLayout(on ? L_PAD : phaseLayout());
+    }
+
+    private void setMoveButtons(boolean on) {
+        mMoveButtons = on;
+        mPrefs.edit().putBoolean("move_buttons", on).apply();
     }
 
     /* ------------------------------------------------------------------ edit mode */
@@ -601,7 +627,8 @@ public class TouchOverlay extends View {
         if (a < 1f) postInvalidateOnAnimation();
         int held = heldBits();
         for (Btn b : mGlobal) drawButton(c, b, (held & b.bits) != 0, a);
-        for (Btn b : mLayouts[mLayout]) drawButton(c, b, (b.flags & F_TOGGLE) != 0 ? b.on : (held & b.bits) != 0 && b.bits != 0 && isHeld(b), a);
+        for (Btn b : mLayouts[mLayout])
+            if (shown(b)) drawButton(c, b, (b.flags & F_TOGGLE) != 0 ? b.on : isHeld(b), a);
 
         if (HAS_STICK[mLayout]) {
             mLine.setStrokeWidth(2 * mDp);
@@ -757,7 +784,7 @@ public class TouchOverlay extends View {
         mFill.setColor(Color.argb(110, 0, 0, 0));
         c.drawRect(0, 0, w, h, mFill);
         for (Btn b : mGlobal) drawButton(c, b, false, 1f);
-        for (Btn b : mLayouts[mEditLayout]) drawButton(c, b, (b.flags & F_TOGGLE) != 0 && b.on, 1f);
+        for (Btn b : mLayouts[mEditLayout]) if (shown(b)) drawButton(c, b, (b.flags & F_TOGGLE) != 0 && b.on, 1f);
         if (mEditSel != null) {
             mLine.setColor(Color.argb(230, 120, 180, 255));
             mLine.setStrokeWidth(2.5f * mDp);
@@ -797,12 +824,12 @@ public class TouchOverlay extends View {
         c.drawText("Done", mEditDone.centerX(), tyb, mText);
     }
 
-    /* the settings panel: dynamic or classic controls, edit the layout, close */
+    /* the settings panel: dynamic or classic controls, how batting moves, edit the layout, close */
     private void drawSettings(Canvas c) {
         int w = getWidth(), h = getHeight();
         mFill.setColor(Color.argb(150, 0, 0, 0));
         c.drawRect(0, 0, w, h, mFill);
-        RectF card = new RectF(w / 2f - 4.2f * mU, h / 2f - 3.2f * mU, w / 2f + 4.2f * mU, h / 2f + 3.2f * mU);
+        RectF card = new RectF(w / 2f - 4.2f * mU, h / 2f - 4.1f * mU, w / 2f + 4.2f * mU, h / 2f + 4.1f * mU);
         mFill.setColor(Color.argb(235, 24, 28, 34));
         c.drawRoundRect(card, 0.3f * mU, 0.3f * mU, mFill);
         mLine.setStrokeWidth(1.5f * mDp);
@@ -824,7 +851,17 @@ public class TouchOverlay extends View {
         drawChoice(c, mSetDynamic, "Dynamic", !mClassic);
         drawChoice(c, mSetClassic, "Classic controller", mClassic);
 
-        float ey = card.top + 3.9f * mU;
+        float my = card.top + 4.05f * mU;
+        if (!mClassic) {
+            mText.setTextSize(0.27f * mU);
+            mText.setColor(Color.argb(180, 255, 255, 255));
+            c.drawText("Batting: what moves the batsman", w / 2f, my - 0.7f * mU, mText);
+            mSetMoveOn.set(card.left + 0.5f * mU, my - 0.5f * mU, w / 2f - 0.1f * mU, my + 0.5f * mU);
+            mSetMoveOff.set(w / 2f + 0.1f * mU, my - 0.5f * mU, card.right - 0.5f * mU, my + 0.5f * mU);
+            drawChoice(c, mSetMoveOn, "Move buttons", mMoveButtons);
+            drawChoice(c, mSetMoveOff, "Joystick only", !mMoveButtons);
+        }
+        float ey = card.top + 5.4f * mU;
         mSetEdit.set(card.left + 0.5f * mU, ey - 0.5f * mU, card.right - 0.5f * mU, ey + 0.5f * mU);
         drawChoice(c, mSetEdit, "Move and resize buttons", false);
 
