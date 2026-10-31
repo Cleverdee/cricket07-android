@@ -350,6 +350,12 @@ static int pad_slot_of(SDL_JoystickID id) {
 }
 static void pad_added(int device_index) {
     if (pad_slot_of(SDL_JoystickGetDeviceInstanceID(device_index)) >= 0) return;
+    /* phones can list built-in parts as joysticks (the Mi 10T Pro's fingerprint sensor, "uinput-fpc"), which would
+       take pad 0 and turn the touch pad off; they have no USB or Bluetooth vendor and product, real controllers do */
+    if (!SDL_JoystickGetDeviceVendor(device_index) && !SDL_JoystickGetDeviceProduct(device_index)) {
+        fprintf(stderr, "controller: ignoring built-in device %s\n", SDL_JoystickNameForIndex(device_index));
+        return;
+    }
     for (int i = 0; i < PAD_SLOTS; i++)
         if (!g_joy[i]) {
             if (SDL_IsGameController(device_index)) {
