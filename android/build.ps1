@@ -156,7 +156,7 @@ $Adb = Join-Path $Sdk "platform-tools\adb.exe"
 
 # SDL2 source and wgpu-native for aarch64-linux-android
 $SdlVersion = "2.32.10"
-$WgpuVersion = "v27.0.4.1"
+$WgpuVersion = "v29.0.1.1"
 $SdlDir = Join-Path $Repo "third_party\SDL2"
 if (-not (Test-Path (Join-Path $SdlDir "android-project"))) {
     $tgz = Join-Path $Tools "SDL2.tar.gz"
@@ -166,7 +166,10 @@ if (-not (Test-Path (Join-Path $SdlDir "android-project"))) {
     Remove-Item -Force $tgz
 }
 $WgpuDir = Join-Path $Repo "third_party\wgpu"
-if (-not (Test-Path (Join-Path $WgpuDir "lib\libwgpu_native.a"))) {
+$WgpuTag = Join-Path $WgpuDir "wgpu-native-meta\wgpu-native-git-tag"
+# a copy from an older build is replaced: v29 fixes driver crashes on Mali-G52 phones (Redmi 9)
+if (-not (Test-Path (Join-Path $WgpuDir "lib\libwgpu_native.a")) -or -not (Test-Path $WgpuTag) -or
+    (Get-Content $WgpuTag -Raw).Trim() -ne $WgpuVersion) {
     $zip = Join-Path $Tools "wgpu.zip"
     Download "https://github.com/gfx-rs/wgpu-native/releases/download/$WgpuVersion/wgpu-android-aarch64-release.zip" $zip
     if (Test-Path $WgpuDir) { Remove-Item -Recurse -Force $WgpuDir }

@@ -48,6 +48,7 @@ expect problems such as the games drifting out of sync.
 
 ## Known limits
 
+- Tested on a Samsung Galaxy A17, Xiaomi Mi 10T Pro and Redmi 9. Other phones may differ.
 - Tested with one version of the game. The builder tells you if yours differs; it may then build but not play correctly.
 - Windows only for now.
 - Many player stats are estimates, so ratings are approximate, and new players use generic faces. Squads are as of
