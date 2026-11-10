@@ -3,7 +3,7 @@
 Play EA Sports Cricket 07 natively on an Android phone, built from **your own copy of the PC game**. This is a
 recompilation, not an emulator: the game's code is translated to C and compiled for ARM, and graphics run on Vulkan.
 
-**No game files are included here, and no ready-made APK is offered.** You need your own installed copy of the game.
+**No game files are included here.** You need your own installed copy of the PC game.
 
 ## What you get
 
@@ -14,7 +14,20 @@ recompilation, not an emulator: the game's code is translated to C and compiled 
 - Local multiplayer: two phones on the same Wi-Fi or hotspot
 - Performance work for mid-range phones: tested on a Samsung Galaxy A17 at around 60 FPS
 
-## Build it
+## Phone only: install the app, then add your game files
+
+1. Download `Cricket07.apk` from [Releases](../../releases) on your phone and open it to install (Android asks you to
+   allow installing from your browser or file manager). You need a 64-bit phone on Android 10 or later with Vulkan.
+2. On your PC, zip the folder Cricket 07 is installed in (usually `C:\Program Files (x86)\EA SPORTS\Cricket 07`):
+   right-click it, then *Send to > Compressed (zipped) folder*. Copy the .zip to your phone any way you like: USB
+   cable, Google Drive, a memory card.
+3. Open the app, tap **Choose a .zip file** and pick it. The app copies the game in (about 1.2 GB), then you can
+   delete the .zip. If you copied the folder over without zipping it, use **Choose a folder** instead.
+
+You can add, replace or delete the game files later from **Game files** on the start screen. The ready-made APK has
+the original 2006 teams: the 2026 rosters are added when you build the APK yourself (below).
+
+## Or build it yourself
 
 You need Windows 10 or 11, [Python 3](https://www.python.org/downloads/) ("Add python.exe to PATH" ticked), about
 15 GB of free disk space, and your installed game.
@@ -25,13 +38,16 @@ You need Windows 10 or 11, [Python 3](https://www.python.org/downloads/) ("Add p
    `builder\compile.ps1` compiles it yourself if you prefer.
 3. Pick your game folder and where to save the APK, then click **Build**.
 
+Building it yourself gives you the 2026 rosters, works with other versions of the game, and puts the game files
+inside the APK, so there's nothing to add on the phone.
+
 The first build downloads about 4 GB of tools (JDK, Ghidra, Android SDK and NDK) and takes about an hour, longer on slower PCs. Those results
 are kept, so later builds are much faster. The APK is about 1.2 GB and needs about 1.2 GB more on the phone, where it
 unpacks its files the first time you open it.
 
 For building from a command line, see [`android/README.md`](android/README.md).
 
-## Install it
+## Install a built APK
 
 Copy `Cricket07.apk` to your phone and open it (Android will ask you to allow installing from that source), or tick
 *Install on my phone* in the builder with the phone connected over USB and USB debugging on. You need a 64-bit phone
@@ -39,8 +55,9 @@ on Android 10 or later with Vulkan.
 
 ## Multiplayer
 
-Both phones have to be on the same Wi-Fi or hotspot and run **the same APK**. The game checks this when connecting,
-and separate builds may not match, so build once and install that APK on your own two phones. One taps **Host a
+Both phones have to be on the same Wi-Fi or hotspot and run **the same APK** with the same game files. The game checks
+this when connecting, and separate builds may not match, so build once and install that APK on your own two phones
+(or both install the release APK and add the same game files). One taps **Host a
 match**, and the other taps **Join a match** and picks it (or types its address).
 
 Multiplayer is new. It has been tested on one phone against a PC stand-in, but not yet between two real phones, so
@@ -50,7 +67,10 @@ expect problems such as the games drifting out of sync.
 
 - Tested on a Samsung Galaxy A17, Xiaomi Mi 10T Pro and Redmi 9. Other phones may differ.
 - Tested with one version of the game. The builder tells you if yours differs; it may then build but not play correctly.
-- Windows only for now.
+- Building is Windows only for now.
+- In the touch-control settings (the gear), **Screen** picks the picture shape: Widescreen (the default: fills the
+  screen and shows a wider view), Stretch, or the original 4:3 with black bars. Menus and the scoreboard are always
+  stretched in the first two. **Button opacity** makes the touch buttons more see-through.
 - Many player stats are estimates, so ratings are approximate, and new players use generic faces. Squads are as of
   October 2026; the IPL ones predate the 2027 retentions.
 - The game has 63 team slots, so the leagues replace the Australian states, A sides, invitation and World XIs, and
@@ -73,4 +93,5 @@ recompiler and the Windows and Direct3D layer. Its own guide is in [`README.brow
 
 This is an unofficial fan project, not affiliated with or endorsed by Electronic Arts. EA SPORTS and Cricket 07 are
 trademarks of their owners. The licence covers the code here only: the game, its code and its data remain the
-property of their owners. APKs you build contain the game, so keep them to yourself and don't share them.
+property of their owners. APKs you build with the game files inside contain the game, so keep them to yourself and
+don't share them.

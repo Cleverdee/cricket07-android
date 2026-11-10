@@ -40,7 +40,7 @@ $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is many times slo
 $Android = $PSScriptRoot
 $Repo = Split-Path $Android -Parent
 $Tools = Join-Path $Repo "third_party\tools"
-$Package = "com.ashenstudios.cricket07"
+$Package = "com.cleverdee.cricket07"
 $Config = Get-Content (Join-Path $Android "config.json") -Raw | ConvertFrom-Json
 
 $NdkVersion = "27.2.12479018"
@@ -188,6 +188,7 @@ if (-not (Test-Path $Exe)) { Fail "no $($Config.exe) in $GameDir. Copy your inst
 # ------------------------------------------------------------------ 3. Ghidra export + translation
 
 $Hash = (Get-FileHash $Exe -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
+$env:RC_EXE_HASH = $Hash   # the app checks imported game files against it (app/build.gradle EXE_SHA256)
 $Work = Join-Path $Repo "work\$Hash"
 $Funcs = Join-Path $Work "functions.json"
 $OutAll = Join-Path $Repo "out_all"

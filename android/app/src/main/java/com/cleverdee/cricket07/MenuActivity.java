@@ -1,4 +1,4 @@
-package com.ashenstudios.cricket07;
+package com.cleverdee.cricket07;
 
 import android.app.Activity;
 import android.content.Context;
@@ -122,6 +122,12 @@ public class MenuActivity extends Activity {
         button("Host a match", v -> showHost());
         button("Join a match", v -> showJoin());
         text("Multiplayer: both phones on the same Wi-Fi, or one on the other's hotspot", 13, Color.rgb(170, 195, 180));
+        if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
+            button("Game files", v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
+    }
+
+    private boolean bundled() {
+        try (InputStream in = getAssets().open("game_manifest.txt")) { return true; } catch (IOException e) { return false; }
     }
 
     private void showHost() {
@@ -352,6 +358,9 @@ public class MenuActivity extends Activity {
         try (InputStream in = getAssets().open("game_manifest.txt")) {
             for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
         } catch (IOException e) { /* a build without bundled files */ }
+        try (InputStream in = new FileInputStream(new File(getExternalFilesDir(null), "game/" + SetupActivity.IMPORTED))) {
+            for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
+        } catch (IOException e) { /* files copied in some other way: not compared */ }
         return Long.toHexString(crc.getValue());
     }
 

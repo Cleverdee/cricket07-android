@@ -1,4 +1,4 @@
-package com.ashenstudios.cricket07;
+package com.cleverdee.cricket07;
 
 import android.content.Context;
 import android.view.SurfaceHolder;

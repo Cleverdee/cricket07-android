@@ -1,4 +1,4 @@
-package com.ashenstudios.cricket07;
+package com.cleverdee.cricket07;
 
 import android.content.Context;
 import android.hardware.input.InputManager;
@@ -37,6 +37,10 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         super.onCreate(savedInstanceState);
         sRunning = true;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        /* use the whole screen, including the strip beside a camera cut-out */
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        getWindow().setAttributes(lp);
         if (System.getenv("RC_NETPLAY") != null) {   /* keeps Wi-Fi out of power saving: fewer late inputs */
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             mWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "cricket07");

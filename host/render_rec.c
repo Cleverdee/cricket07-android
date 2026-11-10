@@ -703,6 +703,9 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
     }
     unpack_color(st->rs[60], u->tfactor);
     u->misc[0] = (st->rs[24] & 255) / 255.f;
+    u->misc[1] = 1.f;
+    /* a perspective view (vertex shaders: 3D models, assumed so), for widescreen in render_wgpu.c */
+    u->misc[2] = sh || st->transform[3][11] != 0.f ? 1.f : 0.f;
     for (int i = 0; i < 4; i++) u->mat_diffuse[i] = 1.f;
     if (u->flags[3]) {
         /* no normals: lit color is emissive + ambient * material ambient (diffuse lighting needs a normal) */

@@ -465,7 +465,7 @@ char *vs_to_wgsl(Shader *sh) {
         }
         put(&b, "  }\n");
     }
-    put(&b, "  var o: VO;\n  var q = opos;\n  q.x = q.x + q.w / u.vp.z;\n  q.y = q.y - q.w / u.vp.w;\n  o.pos = q;\n"
+    put(&b, "  var o: VO;\n  var q = opos;\n  q.x = q.x * u.misc.y;\n  q.x = q.x + q.w / u.vp.z;\n  q.y = q.y - q.w / u.vp.w;\n  o.pos = q;\n"
             "  o.diffuse = saturate(od[0]);\n  o.specular = saturate(od[1]);\n"
             "  o.tc0 = ot[0]; o.tc1 = ot[1]; o.tc2 = ot[2]; o.tc3 = ot[3];\n  return o;\n}\n");
     return b.s;

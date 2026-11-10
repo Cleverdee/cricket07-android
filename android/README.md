@@ -25,8 +25,13 @@ the phone; `-Retranslate` redoes Ghidra and translation; `-Opt "-O3"` and `-Lto`
 
 ## Game files on the phone
 
-They go in **`Android/data/com.ashenstudios.cricket07/files/game/`**, with `cricket07.exe` directly
-inside. Install the APK and open it once first, so Android creates the folder. Then either:
+Without `-Bundle` the app asks for them on first launch: the player picks a .zip of the installed game folder,
+or the folder itself, with Android's file picker, and the app copies it in (`SetupActivity.java`). The import
+warns when `cricket07.exe` isn't the one the code was translated from (`RC_EXE_HASH`, set by build.ps1).
+
+They end up in **`Android/data/com.cleverdee.cricket07/files/game/`**, with `cricket07.exe` directly
+inside. To put them there from a PC instead, install the APK and open it once first, so Android creates the folder.
+Then either:
 
 - run `Build.bat -PushGame`, or
 - copy the folder over USB with a PC file manager. On Android 11 and later the phone's own file
@@ -36,7 +41,7 @@ Saves and settings go in `files/userdata/` next to it.
 
 ## Settings without rebuilding: files/env.txt
 
-`Android/data/com.ashenstudios.cricket07/files/env.txt` holds one `NAME=value` per line:
+`Android/data/com.cleverdee.cricket07/files/env.txt` holds one `NAME=value` per line:
 
 | Line | Effect |
 |---|---|

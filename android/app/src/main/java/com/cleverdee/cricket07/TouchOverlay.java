@@ -1,4 +1,4 @@
-package com.ashenstudios.cricket07;
+package com.cleverdee.cricket07;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -23,7 +23,8 @@ import android.view.View;
    turns "ball in play" into Running, Field opens the field preview. Each layout has its own buttons, and
    their positions and sizes can be changed in edit mode, saved per layout. The gear opens settings: edit mode,
    and a choice between these dynamic controls and a classic controller (every pad button on screen at once,
-   for anyone the dynamic switching doesn't suit).
+   for anyone the dynamic switching doesn't suit). Settings also hold the picture shape (widescreen, stretched
+   or the original 4:3, saved as "aspect") and how see-through the buttons are ("opacity").
 
    Batting: the game moves the batsman while the stick is held left or right, so choosing a shot early walks him
    across the crease. With move buttons on (saved as "move_buttons", the default), the stick's left and right only
@@ -44,6 +45,7 @@ public class TouchOverlay extends View {
     static native int nativeGamePhase();   /* host/gamephase.c PH_*: see phaseLayout() */
     static native int nativeNetState();   /* multiplayer: 0 off, 1 fine, 2 waiting, 3 other player gone, 4 out of sync */
     static native void nativeKey(int scancode, boolean down);   /* a keyboard key (USB HID usage / SDL scancode) */
+    static native void nativeSetAspect(int mode);   /* 0 = 4:3 with bars, 1 = stretched, 2 = widescreen (render_wgpu.c) */
     private static final int KEY_ESCAPE = 41;   /* the game pauses on Escape, not on the pad's Start */
 
     private static final int A = 0, B = 1, X = 2, Y = 3, LB = 4, RB = 5, LT = 6, RT = 7, DUP = 12, DDOWN = 13, DLEFT = 14,
@@ -122,8 +124,15 @@ public class TouchOverlay extends View {
     private boolean mClassic;     /* the classic controller instead of the dynamic layouts (saved as "classic") */
     private boolean mMoveButtons; /* batting: separate buttons move the batsman (see the top of this file) */
     private boolean mSettings;    /* the settings panel is open */
+    private int mAspect;          /* picture shape, see nativeSetAspect */
+    private float mOpacity;       /* buttons: 0.15 (faint) .. 1 (as designed) */
+    private boolean mOpacityDrag; /* a finger is on the opacity slider */
     private final RectF mSetDynamic = new RectF(), mSetClassic = new RectF(), mSetEdit = new RectF(), mSetClose = new RectF(),
-                        mSetMoveOn = new RectF(), mSetMoveOff = new RectF();
+                        mSetMoveOn = new RectF(), mSetMoveOff = new RectF(), mSetOpacity = new RectF();
+    private final RectF[] mSetAspect = { new RectF(), new RectF(), new RectF() };
+    private static final String[] ASPECT_NAMES = { "4:3", "Stretch", "Widescreen" };
+    private static final int[] ASPECT_ORDER = { 2, 1, 0 };   /* as shown, left to right */
+    private static final float MIN_OPACITY = 0.15f;
 
     private int mLayout = L_MENU, mPhase = -1;
     private boolean mShotPlayed, mFieldPreview;
@@ -164,6 +173,9 @@ public class TouchOverlay extends View {
         mPrefs = context.getSharedPreferences("touch_layout", Context.MODE_PRIVATE);
         mClassic = mPrefs.getBoolean("classic", false);
         mMoveButtons = mPrefs.getBoolean("move_buttons", true);
+        mAspect = mPrefs.getInt("aspect", 2);
+        mOpacity = mPrefs.getFloat("opacity", 1f);
+        nativeSetAspect(mAspect);
         if (mClassic) mLayout = L_PAD;
         mLine.setStyle(Paint.Style.STROKE);
         mIcon.setStyle(Paint.Style.STROKE);
@@ -305,10 +317,19 @@ public class TouchOverlay extends View {
        controller while the game is in a menu or cut-scene */
     private boolean hasTouchpad() { return mLayout == L_PAD ? mPhase <= 2 : HAS_TOUCHPAD[mLayout]; }
 
-    /* the game picture: the 4:3 area centred on the screen */
+    /* the game picture: the whole screen, or with 4:3 the area centred on it */
+    private float pictureWidth() { return mAspect == 0 ? Math.min(getWidth(), getHeight() * 4f / 3f) : getWidth(); }
+
     private boolean inGame(float x) {
-        float gw = getHeight() * 4f / 3f, x0 = (getWidth() - gw) / 2f;
+        float gw = pictureWidth(), x0 = (getWidth() - gw) / 2f;
         return x >= x0 && x <= x0 + gw;
+    }
+
+    /* where a touch on the left starts the stick rather than the touchpad: beside the 4:3 picture, or with the
+       picture filling the screen, the same strip at its left edge (at least a thumb's width) */
+    private boolean inStickZone(float x) {
+        float bar = (getWidth() - Math.min(getWidth(), getHeight() * 4f / 3f)) / 2f;
+        return x < Math.max(bar, 2.2f * mU);
     }
 
     /* ------------------------------------------------------------------ touch */
@@ -330,7 +351,7 @@ public class TouchOverlay extends View {
             float x = e.getX(idx), y = e.getY(idx);
             Btn b = buttonAt(mLayout, x, y);
             if (b != null) press(id, b);
-            else if (HAS_STICK[mLayout] && x < getWidth() / 2f && !(hasTouchpad() && inGame(x)) && mStickPointer < 0) {
+            else if (HAS_STICK[mLayout] && x < getWidth() / 2f && !(hasTouchpad() && !inStickZone(x)) && mStickPointer < 0) {
                 mStickPointer = id;   /* the stick appears where the thumb lands */
                 mStickCx = mStickX = x;
                 mStickCy = mStickY = y;
@@ -392,7 +413,7 @@ public class TouchOverlay extends View {
     private long mCursorReadyAt;           /* when the last move will have reached the game */
 
     private void cursorTo(float x, float y, boolean home) {
-        float gw = getHeight() * 4f / 3f, x0 = (getWidth() - gw) / 2f;
+        float gw = pictureWidth(), x0 = (getWidth() - gw) / 2f;
         final float gx = Math.max(0, Math.min(639, (x - x0) / gw * 640f)), gy = Math.max(0, Math.min(479, y / getHeight() * 480f));
         /* only the first touch on a screen: later ones move from where it is. In multiplayer the other player may
            have moved it, so every touch starts from the corner. */
@@ -508,8 +529,19 @@ public class TouchOverlay extends View {
     }
 
     private void settingsTouch(MotionEvent e) {
-        if (e.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+        int action = e.getActionMasked();
         float x = e.getX(), y = e.getY();
+        if (mOpacityDrag) {   /* dragging the slider */
+            if (action == MotionEvent.ACTION_MOVE) setOpacity(x, false);
+            else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) { mOpacityDrag = false; setOpacity(x, true); }
+            invalidate();
+            return;
+        }
+        if (action != MotionEvent.ACTION_DOWN) return;
+        RectF slider = new RectF(mSetOpacity);
+        slider.inset(-0.3f * mU, -0.35f * mU);   /* easier to catch than the thin track */
+        if (slider.contains(x, y)) { mOpacityDrag = true; setOpacity(x, false); invalidate(); return; }
+        for (int i = 0; i < 3; i++) if (mSetAspect[i].contains(x, y)) setAspect(ASPECT_ORDER[i]);
         if (mSetDynamic.contains(x, y)) setClassic(false);
         else if (mSetClassic.contains(x, y)) setClassic(true);
         else if (!mClassic && mSetMoveOn.contains(x, y)) setMoveButtons(true);
@@ -529,6 +561,20 @@ public class TouchOverlay extends View {
     private void setMoveButtons(boolean on) {
         mMoveButtons = on;
         mPrefs.edit().putBoolean("move_buttons", on).apply();
+    }
+
+    private void setAspect(int mode) {
+        if (mode == mAspect) return;
+        mAspect = mode;
+        mCursorKnown = false;   /* taps map to a different picture */
+        mPrefs.edit().putInt("aspect", mode).apply();
+        nativeSetAspect(mode);
+    }
+
+    private void setOpacity(float x, boolean save) {
+        float t = (x - mSetOpacity.left) / mSetOpacity.width();
+        mOpacity = MIN_OPACITY + Math.max(0f, Math.min(1f, t)) * (1f - MIN_OPACITY);
+        if (save) mPrefs.edit().putFloat("opacity", mOpacity).apply();
     }
 
     /* ------------------------------------------------------------------ edit mode */
@@ -623,8 +669,9 @@ public class TouchOverlay extends View {
         if (mSettings) { drawSettings(c); return; }
 
         /* fade the new layout in, so a switch is noticed without being in the way */
-        float a = Math.min(1f, (SystemClock.uptimeMillis() - mFadeStart) / 220f);
-        if (a < 1f) postInvalidateOnAnimation();
+        float fade = Math.min(1f, (SystemClock.uptimeMillis() - mFadeStart) / 220f);
+        if (fade < 1f) postInvalidateOnAnimation();
+        float a = fade * mOpacity;
         int held = heldBits();
         for (Btn b : mGlobal) drawButton(c, b, (held & b.bits) != 0, a);
         for (Btn b : mLayouts[mLayout])
@@ -634,13 +681,13 @@ public class TouchOverlay extends View {
             mLine.setStrokeWidth(2 * mDp);
             mLine.setColor(Color.argb((int) (150 * a), 255, 255, 255));
             if (mStickPointer >= 0) {
-                mFill.setColor(Color.argb(60, 0, 0, 0));
+                mFill.setColor(Color.argb((int) (60 * a), 0, 0, 0));
                 c.drawCircle(mStickCx, mStickCy, mStickRadius, mFill);
                 c.drawCircle(mStickCx, mStickCy, mStickRadius, mLine);
                 float dx = mStickX - mStickCx, dy = mStickY - mStickCy;
                 float len = (float) Math.sqrt(dx * dx + dy * dy);
                 if (len > mStickRadius) { dx *= mStickRadius / len; dy *= mStickRadius / len; }
-                mFill.setColor(Color.argb(140, 255, 255, 255));
+                mFill.setColor(Color.argb((int) (140 * a), 255, 255, 255));
                 c.drawCircle(mStickCx + dx, mStickCy + dy, mStickRadius * 0.45f, mFill);
             } else {   /* where the stick lives: a faint ring at its resting place */
                 mLine.setColor(Color.argb((int) (90 * a), 255, 255, 255));
@@ -783,8 +830,8 @@ public class TouchOverlay extends View {
         int w = getWidth(), h = getHeight();
         mFill.setColor(Color.argb(110, 0, 0, 0));
         c.drawRect(0, 0, w, h, mFill);
-        for (Btn b : mGlobal) drawButton(c, b, false, 1f);
-        for (Btn b : mLayouts[mEditLayout]) if (shown(b)) drawButton(c, b, (b.flags & F_TOGGLE) != 0 && b.on, 1f);
+        for (Btn b : mGlobal) drawButton(c, b, false, mOpacity);
+        for (Btn b : mLayouts[mEditLayout]) if (shown(b)) drawButton(c, b, (b.flags & F_TOGGLE) != 0 && b.on, mOpacity);
         if (mEditSel != null) {
             mLine.setColor(Color.argb(230, 120, 180, 255));
             mLine.setStrokeWidth(2.5f * mDp);
@@ -824,12 +871,13 @@ public class TouchOverlay extends View {
         c.drawText("Done", mEditDone.centerX(), tyb, mText);
     }
 
-    /* the settings panel: dynamic or classic controls, how batting moves, edit the layout, close */
+    /* the settings panel: one row per setting (label left, choices right), then edit mode and close */
     private void drawSettings(Canvas c) {
         int w = getWidth(), h = getHeight();
         mFill.setColor(Color.argb(150, 0, 0, 0));
         c.drawRect(0, 0, w, h, mFill);
-        RectF card = new RectF(w / 2f - 4.2f * mU, h / 2f - 4.1f * mU, w / 2f + 4.2f * mU, h / 2f + 4.1f * mU);
+        float half = Math.min(6.2f * mU, w / 2f - 0.2f * mU);
+        RectF card = new RectF(w / 2f - half, h / 2f - 4.3f * mU, w / 2f + half, h / 2f + 4.3f * mU);
         mFill.setColor(Color.argb(235, 24, 28, 34));
         c.drawRoundRect(card, 0.3f * mU, 0.3f * mU, mFill);
         mLine.setStrokeWidth(1.5f * mDp);
@@ -838,36 +886,80 @@ public class TouchOverlay extends View {
 
         mText.setColor(Color.argb(240, 255, 255, 255));
         mText.setTextSize(0.42f * mU);
-        c.drawText("Touch controls", w / 2f, card.top + 0.85f * mU, mText);
-        mText.setTextSize(0.27f * mU);
-        mText.setColor(Color.argb(180, 255, 255, 255));
-        c.drawText(mClassic ? "Every controller button on screen, the same all the time"
-                            : "Buttons change with what you're doing: batting, bowling, running...",
-                   w / 2f, card.top + 1.45f * mU, mText);
+        c.drawText("Settings", w / 2f, card.top + 0.8f * mU, mText);
 
-        float sy = card.top + 2.5f * mU;
-        mSetDynamic.set(card.left + 0.5f * mU, sy - 0.5f * mU, w / 2f - 0.1f * mU, sy + 0.5f * mU);
-        mSetClassic.set(w / 2f + 0.1f * mU, sy - 0.5f * mU, card.right - 0.5f * mU, sy + 0.5f * mU);
+        float lx = card.left + 0.5f * mU;              /* row labels */
+        float cx0 = card.left + 3.6f * mU, cx1 = card.right - 0.5f * mU;   /* the choices' span */
+        float y = card.top + 1.75f * mU, step = 1.2f * mU;
+
+        rowLabel(c, "Controls", lx, y);
+        split(cx0, cx1, y, 2, mSetDynamic, mSetClassic);
         drawChoice(c, mSetDynamic, "Dynamic", !mClassic);
         drawChoice(c, mSetClassic, "Classic controller", mClassic);
 
-        float my = card.top + 4.05f * mU;
+        y += step;
+        rowLabel(c, "Batting moves", lx, y);
+        split(cx0, cx1, y, 2, mSetMoveOn, mSetMoveOff);
         if (!mClassic) {
-            mText.setTextSize(0.27f * mU);
-            mText.setColor(Color.argb(180, 255, 255, 255));
-            c.drawText("Batting: what moves the batsman", w / 2f, my - 0.7f * mU, mText);
-            mSetMoveOn.set(card.left + 0.5f * mU, my - 0.5f * mU, w / 2f - 0.1f * mU, my + 0.5f * mU);
-            mSetMoveOff.set(w / 2f + 0.1f * mU, my - 0.5f * mU, card.right - 0.5f * mU, my + 0.5f * mU);
             drawChoice(c, mSetMoveOn, "Move buttons", mMoveButtons);
             drawChoice(c, mSetMoveOff, "Joystick only", !mMoveButtons);
+        } else {
+            mSetMoveOn.setEmpty(); mSetMoveOff.setEmpty();
+            mText.setTextSize(0.27f * mU);
+            mText.setColor(Color.argb(150, 255, 255, 255));
+            c.drawText("(dynamic controls only)", (cx0 + cx1) / 2f, y - (mText.descent() + mText.ascent()) / 2, mText);
         }
-        float ey = card.top + 5.4f * mU;
-        mSetEdit.set(card.left + 0.5f * mU, ey - 0.5f * mU, card.right - 0.5f * mU, ey + 0.5f * mU);
+
+        y += step;
+        rowLabel(c, "Screen", lx, y);
+        split(cx0, cx1, y, 3, mSetAspect);
+        for (int i = 0; i < 3; i++) drawChoice(c, mSetAspect[i], ASPECT_NAMES[ASPECT_ORDER[i]], mAspect == ASPECT_ORDER[i]);
+
+        y += step;
+        rowLabel(c, "Button opacity", lx, y);
+        String pct = Math.round(mOpacity * 100) + "%";
+        mText.setTextSize(0.33f * mU);
+        float pw = mText.measureText("100%") + 0.3f * mU;
+        mSetOpacity.set(cx0 + 0.3f * mU, y - 0.06f * mU, cx1 - pw - 0.3f * mU, y + 0.06f * mU);
+        mFill.setColor(Color.argb(110, 255, 255, 255));
+        c.drawRoundRect(mSetOpacity, 0.06f * mU, 0.06f * mU, mFill);
+        float t = (mOpacity - MIN_OPACITY) / (1f - MIN_OPACITY);
+        float kx = mSetOpacity.left + t * mSetOpacity.width();
+        mFill.setColor(Color.argb(240, 255, 255, 255));
+        c.drawRoundRect(new RectF(mSetOpacity.left, mSetOpacity.top, kx, mSetOpacity.bottom), 0.06f * mU, 0.06f * mU, mFill);
+        c.drawCircle(kx, y, 0.26f * mU, mFill);
+        mText.setTextAlign(Paint.Align.RIGHT);
+        mText.setColor(Color.argb(240, 255, 255, 255));
+        c.drawText(pct, cx1, y - (mText.descent() + mText.ascent()) / 2, mText);
+        mText.setTextAlign(Paint.Align.CENTER);
+        /* a sample button at the chosen opacity, so the effect shows without closing the panel */
+        Btn sample = mGlobal[0];
+        float sx = sample.x, sy0 = sample.y, sr = sample.r;
+        sample.x = lx + 3.0f * mU; sample.y = y; sample.r = 0.4f * mU;
+        drawButton(c, sample, false, mOpacity);
+        sample.x = sx; sample.y = sy0; sample.r = sr;
+
+        y += step;
+        mSetEdit.set(card.left + 0.5f * mU, y - 0.45f * mU, card.right - 0.5f * mU, y + 0.45f * mU);
         drawChoice(c, mSetEdit, "Move and resize buttons", false);
 
-        float cy = card.bottom - 0.9f * mU;
+        float cy = card.bottom - 0.8f * mU;
         mSetClose.set(w / 2f - 1.6f * mU, cy - 0.45f * mU, w / 2f + 1.6f * mU, cy + 0.45f * mU);
         drawChoice(c, mSetClose, "Close", true);
+    }
+
+    private void rowLabel(Canvas c, String s, float x, float y) {
+        mText.setTextAlign(Paint.Align.LEFT);
+        mText.setTextSize(0.31f * mU);
+        mText.setColor(Color.argb(200, 255, 255, 255));
+        c.drawText(s, x, y - (mText.descent() + mText.ascent()) / 2, mText);
+        mText.setTextAlign(Paint.Align.CENTER);
+    }
+
+    /* n equal boxes across [x0, x1], centred on y */
+    private void split(float x0, float x1, float y, int n, RectF... out) {
+        float gap = 0.2f * mU, bw = (x1 - x0 - gap * (n - 1)) / n;
+        for (int i = 0; i < n; i++) out[i].set(x0 + i * (bw + gap), y - 0.45f * mU, x0 + i * (bw + gap) + bw, y + 0.45f * mU);
     }
 
     private void drawChoice(Canvas c, RectF r, String label, boolean on) {
@@ -876,7 +968,7 @@ public class TouchOverlay extends View {
         mLine.setColor(Color.argb(200, 255, 255, 255));
         mLine.setStrokeWidth(1.5f * mDp);
         c.drawRoundRect(r, 0.2f * mU, 0.2f * mU, mLine);
-        mText.setTextSize(0.33f * mU);
+        mText.setTextSize(Math.min(0.33f * mU, r.width() / Math.max(1, label.length()) * 1.7f));
         mText.setColor(on ? Color.argb(240, 20, 24, 28) : Color.argb(240, 255, 255, 255));
         c.drawText(label, r.centerX(), r.centerY() - (mText.descent() + mText.ascent()) / 2, mText);
     }

@@ -44,7 +44,7 @@ static const char *WGSL_COMMON =
 "  st1: vec4<u32>,\n"
 "  st1b: vec4<u32>,\n"
 "  tfactor: vec4<f32>,\n"
-"  misc: vec4<f32>,      // x: alpha ref (0..1)\n"
+"  misc: vec4<f32>,      // x: alpha ref (0..1), y: clip-space x scale (widescreen), z: perspective draw\n"
 "  mat_diffuse: vec4<f32>,\n"
 "  ambient: vec4<f32>,\n"
 "  psc: array<vec4<f32>, 8>,   // pixel shader constants c0-c7\n"
@@ -75,6 +75,7 @@ static const char *WGSL_COMMON =
 "  } else {\n"
 "    var p = u.mvp * vec4<f32>(v.pos.xyz, 1.0);\n"
 "    if (u.flags.x == 2u) { p = v.pos; }   // vertex shader output: already in clip space\n"
+"    p.x = p.x * u.misc.y;                 // widescreen: 3D keeps its shape in the stretched picture\n"
 "    p.x = p.x + p.w / u.vp.z;\n"
 "    p.y = p.y - p.w / u.vp.w;\n"
 "    o.pos = p;\n"
@@ -186,7 +187,14 @@ static WGPUQueue g_queue;
 static WGPUSurface g_surface;
 static WGPUTextureFormat g_surf_fmt;
 static WGPUCompositeAlphaMode g_surf_alpha = WGPUCompositeAlphaMode_Opaque;
-static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window */
+static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window, or all of it */
+/* Picture shape: 0 = 4:3 with black bars, 1 = stretched to the window, 2 = widescreen (stretched, but 3D
+   drawn with the window's shape: a wider view instead of wide players). RC_ASPECT=43|stretch|wide picks it;
+   on Android the app can change it while the game runs (render_set_aspect). */
+static volatile int g_aspect_req = -1;
+static int g_aspect = -1;        /* the mode the back buffer was made for */
+static float g_wide_xs = 1.f;    /* clip-space x scale for 3D draws into the back buffer */
+void render_set_aspect(int mode) { g_aspect_req = mode; }
 static int g_win_w, g_win_h;     /* window (swap chain) size; the back buffer is centred in it */
 static int g_cfg_window_w, g_cfg_window_h;   /* g_window_w/h the swap chain was configured for */
 static uint32_t g_present_modes;             /* bit per WGPUPresentMode the surface offers */
@@ -346,9 +354,20 @@ static void configure_surface(void) {
         g_win_h = render_h;
     }
 #endif
+    if (g_aspect_req < 0) {
+        const char *a = getenv("RC_ASPECT");
+#ifdef __ANDROID__
+        g_aspect_req = a && !strcmp(a, "43") ? 0 : a && !strcmp(a, "stretch") ? 1 : 2;
+#else
+        g_aspect_req = a && !strcmp(a, "wide") ? 2 : a && !strcmp(a, "stretch") ? 1 : 0;
+#endif
+    }
+    g_aspect = g_aspect_req;
+    if (g_aspect) { g_surf_w = g_win_w; g_surf_h = g_win_h; }
     /* the game is 4:3: render at the largest 4:3 size that fits, letterboxed (no stretching) */
-    if (g_win_w * 3 > g_win_h * 4) { g_surf_h = g_win_h; g_surf_w = g_win_h * 4 / 3; }
+    else if (g_win_w * 3 > g_win_h * 4) { g_surf_h = g_win_h; g_surf_w = g_win_h * 4 / 3; }
     else { g_surf_w = g_win_w; g_surf_h = g_win_w * 3 / 4; }
+    g_wide_xs = g_aspect == 2 ? (4.f / 3.f) * (float)g_surf_h / (float)g_surf_w : 1.f;
     WGPUSurfaceConfiguration sc = WGPU_SURFACE_CONFIGURATION_INIT;
     sc.device = g_dev;
     sc.format = g_surf_fmt;
@@ -1166,7 +1185,7 @@ static void submit(void) {
 
 static void begin_frame(void) {
     if (g_frame_open) return;
-    if (g_window_w != g_cfg_window_w || g_window_h != g_cfg_window_h) {
+    if (g_window_w != g_cfg_window_w || g_window_h != g_cfg_window_h || g_aspect_req != g_aspect) {
         end_pass();
         pt_wait(1);   /* not while the present thread uses the surface */
         configure_surface();
@@ -1486,6 +1505,14 @@ static void exec_draw(const CmdDraw *c) {
     }
     memcpy(g_vstage + g_vpos, verts, bytes + ibytes);
     memcpy(g_ustage + g_upos, &c->u, sizeof c->u);
+    /* widescreen: perspective 3D drawn into the back buffer keeps its shape (2D and render targets stretch).
+       Not in the menus, whose panels are 3D but laid out for the 4:3 cursor: they stretch like the 2D. */
+    float xs = g_wide_xs;
+#ifdef __ANDROID__
+    extern int gamephase_current(void);
+    if (gamephase_current() <= 1) xs = 1.f;   /* 0 = not known yet (start-up screens), 1 = menu */
+#endif
+    ((Uniforms *)(g_ustage + g_upos))->misc[1] = !g_tgt_gs && c->u.flags[0] != 1 && c->u.misc[2] != 0.f ? xs : 1.f;
 
     WGPUBindGroupEntry te[8];
     for (int i = 0; i < 4; i++) {

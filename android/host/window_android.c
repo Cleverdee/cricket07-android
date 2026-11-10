@@ -132,7 +132,7 @@ void android_present_end(void) {
     pthread_mutex_unlock(&g_surf_lock);
 }
 
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameSurface_nativeSurfaceReady(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_GameSurface_nativeSurfaceReady(JNIEnv *env, jclass cls,
                                                                                        jobject surface) {
     (void)cls;
     ANativeWindow *w = ANativeWindow_fromSurface(env, surface);
@@ -158,7 +158,7 @@ JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameSurface_nativeSurface
 }
 
 /* UI thread, before Android destroys the surface: waits for an in-flight present, then blocks the next */
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameSurface_nativeSurfaceGone(JNIEnv *env, jclass cls) {
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_GameSurface_nativeSurfaceGone(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     pthread_mutex_lock(&g_surf_lock);
     g_surf_ok = 0;
@@ -170,7 +170,7 @@ JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameSurface_nativeSurface
    event loop applies it like a real key */
 static volatile uint32_t g_touch_esc;
 static volatile int g_touch_dirty = 1;
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeKey(JNIEnv *env, jclass cls, jint scancode,
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeKey(JNIEnv *env, jclass cls, jint scancode,
                                                                              jboolean down) {
     (void)env; (void)cls;
     extern int netplay_on(void);
@@ -190,7 +190,7 @@ JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeKey(JN
 
 /* multiplayer state for the overlay's message: 0 not multiplayer, 1 fine, 2 waiting for the other player,
    3 the other player has gone, 4 the two games have drifted apart */
-JNIEXPORT jint JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeNetState(JNIEnv *env, jclass cls) {
+JNIEXPORT jint JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeNetState(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     extern int netplay_on(void);
     extern uint32_t netplay_status(int what);
@@ -202,15 +202,22 @@ JNIEXPORT jint JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeNetSta
 
 /* the game phase for the overlay's layouts (host/gamephase.c): 0 unknown, 1 menu, 2 cut-scene, 3 batting
    delivery, 4 batting ball in play, 5 bowling delivery, 6 bowling ball in play */
-JNIEXPORT jint JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeGamePhase(JNIEnv *env, jclass cls) {
+JNIEXPORT jint JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeGamePhase(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     extern int gamephase_current(void);
     return gamephase_current();
 }
 
+/* the overlay's Screen setting: 0 = 4:3 with bars, 1 = stretched, 2 = widescreen; applies from the next frame */
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeSetAspect(JNIEnv *env, jclass cls, jint mode) {
+    (void)env; (void)cls;
+    extern void render_set_aspect(int mode);
+    render_set_aspect(mode);
+}
+
 /* UI thread, from GameActivity.onPause/onResume: SDL's own pause handling blocks its event loop, so
    anything that must happen while the app is in the background is driven from here */
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameActivity_nativeForeground(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_GameActivity_nativeForeground(JNIEnv *env, jclass cls,
                                                                                       jboolean foreground) {
     (void)env; (void)cls;
     fprintf(stderr, "app %s\n", foreground ? "in the foreground" : "in the background");
@@ -219,7 +226,7 @@ JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_GameActivity_nativeForegr
 
 /* frames presented per second, for the overlay; -1 (no readout) without RC_SHOW_FPS=1 or before the
    first second has passed */
-JNIEXPORT jint JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeFps(JNIEnv *env, jclass cls) {
+JNIEXPORT jint JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeFps(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     if (!getenv("RC_SHOW_FPS")) return -1;
     static unsigned last_frames;
@@ -253,7 +260,7 @@ static void touch_report(void) {
     input_gamepad(0, 1, g_touch_buttons | g_touch_esc, g_touch_lx, g_touch_ly, 0, 0);
 }
 
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeTouchPad(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeTouchPad(JNIEnv *env, jclass cls,
                                                                                   jint buttons, jint lx, jint ly) {
     (void)env; (void)cls;
     g_touch_buttons = (uint32_t)buttons;
@@ -286,7 +293,7 @@ static void touch_mouse_apply(void) {
     pthread_mutex_unlock(&g_tmouse_lock);
 }
 
-JNIEXPORT void JNICALL Java_com_ashenstudios_cricket07_TouchOverlay_nativeTouchMouse(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeTouchMouse(JNIEnv *env, jclass cls,
                                                                                     jint button, jint dx, jint dy) {
     (void)env; (void)cls;
     __atomic_add_fetch(&g_tmouse_dx, dx, __ATOMIC_ACQ_REL);
