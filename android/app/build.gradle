@@ -16,8 +16,8 @@ android {
         applicationId 'com.cleverdee.cricket07'
         minSdk 29
         targetSdk 35
-        versionCode 3
-        versionName '1.2'
+        versionCode 4
+        versionName '1.2.1'
         // the first 16 hex digits of the SHA-256 of the exe the code was translated from (build.ps1 sets it): the
         // import screen warns when the player's copy differs. Empty: no check.
         buildConfigField 'String', 'EXE_SHA256', "\"${System.getenv('RC_EXE_HASH') ?: ''}\""

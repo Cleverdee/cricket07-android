@@ -350,6 +350,37 @@ static void pad_report(int slot) {
                   SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
                   SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
 }
+/* GameActivity.isRealController(name), looked up when the library loads (the only time FindClass sees app classes) */
+static jclass g_game_cls;
+static jmethodID g_is_real_pad;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void)reserved;
+    JNIEnv *env;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+    jclass c = (*env)->FindClass(env, "com/cleverdee/cricket07/GameActivity");
+    if (c) {
+        g_game_cls = (*env)->NewGlobalRef(env, c);
+        g_is_real_pad = (*env)->GetStaticMethodID(env, c, "isRealController", "(Ljava/lang/String;)Z");
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    return JNI_VERSION_1_6;
+}
+
+/* Android's view of the device: an external gamepad with face buttons. Phones list built-in parts as joysticks
+   (the Mi 10T Pro's fingerprint sensor, a Poco M5 part with a real vendor id), which would take pad 0 and leave
+   the touch controls with nothing to drive. Unknown to Android: trusted. */
+static int real_controller(const char *name) {
+    if (!g_game_cls || !g_is_real_pad || !name) return 1;
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env) return 1;
+    jstring s = (*env)->NewStringUTF(env, name);
+    jboolean ok = (*env)->CallStaticBooleanMethod(env, g_game_cls, g_is_real_pad, s);
+    (*env)->DeleteLocalRef(env, s);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return 1; }
+    return ok;
+}
+
 static int pad_slot_of(SDL_JoystickID id) {
     for (int i = 0; i < PAD_SLOTS; i++)
         if (g_joy[i] && SDL_JoystickInstanceID(g_joy[i]) == id) return i;
@@ -361,6 +392,10 @@ static void pad_added(int device_index) {
        take pad 0 and turn the touch pad off; they have no USB or Bluetooth vendor and product, real controllers do */
     if (!SDL_JoystickGetDeviceVendor(device_index) && !SDL_JoystickGetDeviceProduct(device_index)) {
         fprintf(stderr, "controller: ignoring built-in device %s\n", SDL_JoystickNameForIndex(device_index));
+        return;
+    }
+    if (!real_controller(SDL_JoystickNameForIndex(device_index))) {
+        fprintf(stderr, "controller: ignoring %s (not an external gamepad)\n", SDL_JoystickNameForIndex(device_index));
         return;
     }
     for (int i = 0; i < PAD_SLOTS; i++)

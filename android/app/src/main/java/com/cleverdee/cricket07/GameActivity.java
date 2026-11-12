@@ -39,7 +39,9 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         /* use the whole screen, including the strip beside a camera cut-out */
         WindowManager.LayoutParams lp = getWindow().getAttributes();
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        lp.layoutInDisplayCutoutMode = android.os.Build.VERSION.SDK_INT >= 30
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS   /* some MIUI/HyperOS phones kept a bar with SHORT_EDGES */
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         getWindow().setAttributes(lp);
         if (System.getenv("RC_NETPLAY") != null) {   /* keeps Wi-Fi out of power saving: fewer late inputs */
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -95,6 +97,20 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         if ((d.getSources() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD) return false;
         boolean[] keys = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B);
         return keys[0] && keys[1];
+    }
+
+    /* host/window_android.c, for each joystick SDL finds: is the device of that name a real pad? Android knows which
+       devices are external; SDL doesn't. A name Android doesn't list is trusted. */
+    static boolean isRealController(String name) {
+        boolean seen = false;
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || !name.equals(d.getName())) continue;
+            if (isController(d)) return true;
+            seen = true;
+        }
+        if (seen) Log.i("cricket07", "not a controller: " + name);
+        return !seen;
     }
 
     private void updateOverlay() {
