@@ -16,8 +16,8 @@ android {
         applicationId 'com.cleverdee.cricket07'
         minSdk 29
         targetSdk 35
-        versionCode 4
-        versionName '1.2.1'
+        versionCode 5
+        versionName '1.2.2'
         // the first 16 hex digits of the SHA-256 of the exe the code was translated from (build.ps1 sets it): the
         // import screen warns when the player's copy differs. Empty: no check.
         buildConfigField 'String', 'EXE_SHA256', "\"${System.getenv('RC_EXE_HASH') ?: ''}\""
@@ -25,6 +25,9 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DRC_REPO=${repo}", "-DSDL2_SRC=${sdlDir}", "-DANDROID_STL=c++_shared",
+                          // 16 KB page alignment: phones with 16 KB pages (allowed since Android 15) won't load
+                          // libraries aligned for 4 KB; aligned this way they load on both
+                          "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                           "-DRC_OPT=${System.getenv('RC_OPT') ?: '-O2'}", "-DRC_LTO=${System.getenv('RC_LTO') ?: 'OFF'}"
             }
         }

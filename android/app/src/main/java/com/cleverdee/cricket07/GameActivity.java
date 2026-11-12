@@ -34,6 +34,14 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        /* a Java crash goes in the crash report too (the native side writes its own, host/window_android.c) */
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        final java.io.File crash = new java.io.File(getExternalFilesDir(null), "crash.txt");
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try (java.io.PrintWriter w = new java.io.PrintWriter(crash)) { e.printStackTrace(w); }
+            catch (java.io.IOException io) { /* no report then */ }
+            if (prev != null) prev.uncaughtException(t, e);
+        });
         super.onCreate(savedInstanceState);
         sRunning = true;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

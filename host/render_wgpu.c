@@ -305,6 +305,16 @@ static void obj_del(uint32_t id) {
 static void on_adapter(WGPURequestAdapterStatus st, WGPUAdapter a, WGPUStringView msg, void *u1, void *u2) {
     (void)u2;
     if (st != WGPURequestAdapterStatus_Success) fprintf(stderr, "[wgpu] adapter: %.*s\n", (int)msg.length, msg.data);
+#ifndef __EMSCRIPTEN__
+    else {   /* the GPU and driver, for crash reports */
+        WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
+        if (wgpuAdapterGetInfo(a, &info) == WGPUStatus_Success) {
+            fprintf(stderr, "[wgpu] GPU: %.*s, driver %.*s (%.*s)\n", (int)info.device.length, info.device.data,
+                    (int)info.description.length, info.description.data, (int)info.architecture.length, info.architecture.data);
+            wgpuAdapterInfoFreeMembers(info);
+        }
+    }
+#endif
     *(WGPUAdapter *)u1 = a;
 }
 static void on_device(WGPURequestDeviceStatus st, WGPUDevice d, WGPUStringView msg, void *u1, void *u2) {

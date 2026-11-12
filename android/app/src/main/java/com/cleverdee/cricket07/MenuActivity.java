@@ -69,8 +69,53 @@ public class MenuActivity extends Activity {
         mDp = getResources().getDisplayMetrics().density;
         mRoot = Ui.page(this);
         /* mods were in and the game never reached its menu: offer to take them out */
-        if (Mods.launching(this).delete() && Mods.anyApplied(this)) showModTrouble();
-        else showMain();
+        boolean modTrouble = Mods.launching(this).delete() && Mods.anyApplied(this);
+        Runnable next = modTrouble ? this::showModTrouble : this::showMain;
+        File crash = new File(getExternalFilesDir(null), "crash.txt");
+        if (crash.isFile()) showCrash(crash, next);
+        else next.run();
+    }
+
+    /* The game crashed last time (host/window_android.c or GameActivity wrote crash.txt): offer to share a report,
+       the crash and the end of the game's log, through any app the player likes. */
+    private void showCrash(File crash, Runnable next) {
+        mStop = true;
+        Ui.clear(mRoot);
+        Ui.heading(mRoot, "The game closed unexpectedly");
+        text("Help get it fixed: share or copy the crash report and send it to Cleverdee any way you like, "
+           + "on Reddit, GitHub or in a message. It has your phone model, Android version and the game's log; "
+           + "nothing personal.", 15, Ui.SOFT);
+        final String report = crashReport(crash);
+        crash.delete();
+        button("Share report", v -> {
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_SUBJECT, "Cricket 07 crash report");
+            send.putExtra(Intent.EXTRA_TEXT, report);
+            try { startActivity(Intent.createChooser(send, "Send the crash report")); }
+            catch (android.content.ActivityNotFoundException e) { /* nothing to send it with */ }
+        });
+        button("Copy report", v -> {
+            android.content.ClipboardManager cb = (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            cb.setPrimaryClip(android.content.ClipData.newPlainText("Cricket 07 crash report", report));
+            android.widget.Toast.makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT).show();
+        });
+        Ui.button(mRoot, "Continue", true, v -> next.run());
+    }
+
+    private String crashReport(File crash) {
+        StringBuilder r = new StringBuilder("Cricket 07 crash report\n");
+        String version = "?";
+        try { version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { /* unknown */ }
+        r.append("App ").append(version).append(", ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+         .append(", Android ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(')');
+        if (Build.VERSION.SDK_INT >= 31) r.append(", ").append(Build.SOC_MANUFACTURER).append(' ').append(Build.SOC_MODEL);
+        r.append("\n\n");
+        for (String l : Mods.readLines(crash)) r.append(l).append('\n');
+        java.util.List<String> log = Mods.readLines(new File(getExternalFilesDir(null), "last_log.txt"));
+        r.append("\nlog (last lines):\n");
+        for (int i = Math.max(0, log.size() - 120); i < log.size(); i++) r.append(log.get(i)).append('\n');
+        return r.toString();
     }
 
     @Override

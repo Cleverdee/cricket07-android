@@ -19,6 +19,10 @@
 #include <SDL.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unwind.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
@@ -41,6 +45,17 @@ void dsound_android_lifecycle(int foreground);   /* host/dsound.c */
 
 /* ------------------------------------------------------------------ logcat */
 
+/* also kept in files/last_log.txt (this run only, up to 4 MB) for the crash report (MenuActivity) */
+static volatile int g_log_fd = -1;
+static size_t g_log_bytes;
+
+static void log_file(const char *s, size_t n) {
+    int fd = g_log_fd;
+    if (fd < 0 || g_log_bytes > (4u << 20)) return;
+    g_log_bytes += n + 1;
+    if (write(fd, s, n) < 0 || write(fd, "\n", 1) < 0) g_log_fd = -1;
+}
+
 static int g_log_pipe[2];
 static void *log_thread(void *arg) {
     (void)arg;
@@ -54,6 +69,7 @@ static void *log_thread(void *arg) {
         while ((nl = memchr(start, '\n', len - (size_t)(start - buf)))) {
             *nl = 0;
             __android_log_write(ANDROID_LOG_INFO, TAG, start);
+            log_file(start, (size_t)(nl - start));
             start = nl + 1;
         }
         len -= (size_t)(start - buf);
@@ -93,12 +109,91 @@ static void load_env(const char *dir) {
     fclose(f);
 }
 
+/* ------------------------------------------------------------------ crash report */
+
+/* A crash (any thread) writes files/crash.txt: the signal and the call stack as library + offset, which
+   llvm-addr2line on the unstripped libcricket07.so (android/app/build/intermediates) turns into source lines. The next start
+   screen offers to share it with the log (MenuActivity). Then the default handler runs, as before. */
+static char g_crash_path[1100];
+
+typedef struct { int fd, n; } Trace;
+
+static void put_str(int fd, const char *s) { if (write(fd, s, strlen(s)) < 0) { /* nothing to do */ } }
+
+static void put_hex(int fd, uintptr_t v) {
+    char b[19] = "0x";
+    int n = 0;
+    char t[16];
+    do { t[n++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v && n < 16);
+    for (int i = 0; i < n; i++) b[2 + i] = t[n - 1 - i];
+    b[2 + n] = 0;
+    put_str(fd, b);
+}
+
+static void put_frame(int fd, uintptr_t pc) {
+    Dl_info di;
+    put_str(fd, "  ");
+    if (dladdr((void *)pc, &di) && di.dli_fname) {
+        const char *base = strrchr(di.dli_fname, '/');
+        put_str(fd, base ? base + 1 : di.dli_fname);
+        put_str(fd, " +");
+        put_hex(fd, pc - (uintptr_t)di.dli_fbase);
+        if (di.dli_sname) { put_str(fd, " "); put_str(fd, di.dli_sname); }
+    } else {
+        put_hex(fd, pc);
+    }
+    put_str(fd, "\n");
+}
+
+static _Unwind_Reason_Code trace_one(struct _Unwind_Context *c, void *arg) {
+    Trace *t = arg;
+    uintptr_t pc = _Unwind_GetIP(c);
+    if (pc) put_frame(t->fd, pc);
+    return ++t->n >= 48 ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+
+static void on_crash(int sig, siginfo_t *si, void *uc) {
+    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        put_str(fd, "signal ");
+        put_hex(fd, (uintptr_t)sig);
+        put_str(fd, " code ");
+        put_hex(fd, (uintptr_t)si->si_code);
+        put_str(fd, " fault address ");
+        put_hex(fd, (uintptr_t)si->si_addr);
+        put_str(fd, "\ncrash point:\n");
+        put_frame(fd, (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc);
+        put_frame(fd, (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30]);   /* return address (lr) */
+        put_str(fd, "stack:\n");
+        Trace t = { fd, 0 };
+        _Unwind_Backtrace(trace_one, &t);
+        close(fd);
+    }
+    signal(sig, SIG_DFL);   /* and crash as before, so Android's own report is written too */
+    raise(sig);
+}
+
+static void crash_report_init(const char *ext) {
+    char path[1100];
+    snprintf(path, sizeof path, "%s/last_log.txt", ext);
+    g_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    snprintf(g_crash_path, sizeof g_crash_path, "%s/crash.txt", ext);
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+}
+
 /* Android/data/<package>/files/game; NULL (after telling the player) if it isn't there */
 const char *android_game_dir(void) {
     static char dir[4096];
     const char *ext = SDL_AndroidGetExternalStoragePath();   /* .../Android/data/<package>/files */
     if (!ext) { fprintf(stderr, "no external storage: %s\n", SDL_GetError()); return NULL; }
+    crash_report_init(ext);
     load_env(ext);
+    if (getenv("RC_TEST_CRASH")) *(volatile int *)16 = 0;   /* env.txt RC_TEST_CRASH=1: tries the crash report */
     snprintf(dir, sizeof dir, "%s/game", ext);
     char exe[1100];
     snprintf(exe, sizeof exe, "%s/%s", dir, getenv("RC_EXE") ? getenv("RC_EXE") : PROFILE_EXE);
@@ -224,14 +319,21 @@ JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_GameActivity_nativeForegroun
     dsound_android_lifecycle(foreground);
 }
 
-/* frames presented per second, for the overlay; -1 (no readout) without RC_SHOW_FPS=1 or before the
-   first second has passed */
+/* the overlay's FPS counter setting */
+static volatile int g_show_fps;
+JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeShowFps(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    g_show_fps = on;
+}
+
+/* frames presented per second, for the overlay; -1 (no readout) with the counter off (setting, or RC_SHOW_FPS=1)
+   or before the first second has passed */
 JNIEXPORT jint JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeFps(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
-    if (!getenv("RC_SHOW_FPS")) return -1;
     static unsigned last_frames;
     static double last_t;
     static int fps = -1;
+    if (!g_show_fps && !getenv("RC_SHOW_FPS")) { last_t = 0; fps = -1; return -1; }   /* starts afresh when on again */
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double t = ts.tv_sec + ts.tv_nsec * 1e-9;

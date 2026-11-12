@@ -45,6 +45,7 @@ public class TouchOverlay extends View {
     static native int nativeGamePhase();   /* host/gamephase.c PH_*: see phaseLayout() */
     static native int nativeNetState();   /* multiplayer: 0 off, 1 fine, 2 waiting, 3 other player gone, 4 out of sync */
     static native void nativeKey(int scancode, boolean down);   /* a keyboard key (USB HID usage / SDL scancode) */
+    static native void nativeShowFps(boolean on);   /* the FPS counter, top left */
     static native void nativeSetAspect(int mode);   /* 0 = 4:3 with bars, 1 = stretched, 2 = widescreen (render_wgpu.c) */
     private static final int KEY_ESCAPE = 41;   /* the game pauses on Escape, not on the pad's Start */
 
@@ -128,7 +129,8 @@ public class TouchOverlay extends View {
     private float mOpacity;       /* buttons: 0.15 (faint) .. 1 (as designed) */
     private boolean mOpacityDrag; /* a finger is on the opacity slider */
     private final RectF mSetDynamic = new RectF(), mSetClassic = new RectF(), mSetEdit = new RectF(), mSetClose = new RectF(),
-                        mSetMoveOn = new RectF(), mSetMoveOff = new RectF(), mSetOpacity = new RectF();
+                        mSetMoveOn = new RectF(), mSetMoveOff = new RectF(), mSetOpacity = new RectF(), mSetFps = new RectF();
+    private boolean mShowFps;     /* the FPS counter (saved as "show_fps") */
     private final RectF[] mSetAspect = { new RectF(), new RectF(), new RectF() };
     private static final String[] ASPECT_NAMES = { "4:3", "Stretch", "Widescreen" };
     private static final int[] ASPECT_ORDER = { 2, 1, 0 };   /* as shown, left to right */
@@ -175,6 +177,8 @@ public class TouchOverlay extends View {
         mMoveButtons = mPrefs.getBoolean("move_buttons", true);
         mAspect = mPrefs.getInt("aspect", 2);
         mOpacity = mPrefs.getFloat("opacity", 1f);
+        mShowFps = mPrefs.getBoolean("show_fps", false);
+        nativeShowFps(mShowFps);
         nativeSetAspect(mAspect);
         if (mClassic) mLayout = L_PAD;
         mLine.setStyle(Paint.Style.STROKE);
@@ -548,6 +552,12 @@ public class TouchOverlay extends View {
         else if (!mClassic && mSetMoveOn.contains(x, y)) setMoveButtons(true);
         else if (!mClassic && mSetMoveOff.contains(x, y)) setMoveButtons(false);
         else if (mSetEdit.contains(x, y)) { mSettings = false; enterEdit(); }
+        else if (mSetFps.contains(x, y)) {
+            mShowFps = !mShowFps;
+            mPrefs.edit().putBoolean("show_fps", mShowFps).apply();
+            nativeShowFps(mShowFps);
+            if (!mShowFps) mFps = -1;
+        }
         else if (mSetClose.contains(x, y)) { mSettings = false; send(); }
         invalidate();
     }
@@ -661,7 +671,12 @@ public class TouchOverlay extends View {
         if (mFps >= 0) {
             mText.setTextAlign(Paint.Align.LEFT);
             mText.setTextSize(0.32f * mU);
-            c.drawText(mFps + " fps", 8 * mDp, mText.getTextSize() + 4 * mDp, mText);
+            Btn gear = mGlobal[1];   /* beside the gear, clear of the buttons (or the top left while they're hidden) */
+            float fx = mHidden ? 8 * mDp : gear.x + gear.r + 0.3f * mU;
+            float fy = mHidden ? mText.getTextSize() + 4 * mDp : gear.y - (mText.descent() + mText.ascent()) / 2;
+            mText.setShadowLayer(3 * mDp, 0, 1 * mDp, Color.argb(200, 0, 0, 0));
+            c.drawText(mFps + " fps", fx, fy, mText);
+            mText.clearShadowLayer();
             mText.setTextAlign(Paint.Align.CENTER);
         }
         drawNetMessage(c);
@@ -941,8 +956,9 @@ public class TouchOverlay extends View {
         sample.x = sx; sample.y = sy0; sample.r = sr;
 
         y += step;
-        mSetEdit.set(card.left + 0.5f * mU, y - 0.45f * mU, card.right - 0.5f * mU, y + 0.45f * mU);
+        split(card.left + 0.5f * mU, card.right - 0.5f * mU, y, 2, mSetEdit, mSetFps);
         drawChoice(c, mSetEdit, "Move and resize buttons", false);
+        drawChoice(c, mSetFps, mShowFps ? "FPS counter: on" : "FPS counter: off", mShowFps);
 
         float cy = card.bottom - 0.8f * mU;
         mSetClose.set(w / 2f - 1.6f * mU, cy - 0.45f * mU, w / 2f + 1.6f * mU, cy + 0.45f * mU);
