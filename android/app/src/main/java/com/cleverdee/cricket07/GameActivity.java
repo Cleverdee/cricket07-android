@@ -46,6 +46,11 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
             mWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "cricket07");
             mWifiLock.acquire();
         }
+        /* with mods in, note that the game is starting; reachedMenu() clears it. Still there next time: the start
+           screen offers to switch the mods off (MenuActivity). */
+        if (Mods.anyApplied(this)) {
+            try { Mods.write(Mods.launching(this), "1"); } catch (java.io.IOException e) { /* no guard then */ }
+        }
         if (mLayout == null) return;   /* SDL showed an error (e.g. missing libraries) */
         mOverlay = new TouchOverlay(this);
         mLayout.addView(mOverlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -54,6 +59,9 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         mInput.registerInputDeviceListener(this, null);
         updateOverlay();
     }
+
+    /* the overlay saw the game's menu: it started fine */
+    static void reachedMenu(Context c) { Mods.launching(c).delete(); }
 
     /* host: audio keeps the game's sound clock running while paused, and is reopened on return */
     static native void nativeForeground(boolean foreground);

@@ -27,6 +27,15 @@ recompilation, not an emulator: the game's code is translated to C and compiled 
 You can add, replace or delete the game files later from **Game files** on the start screen. The ready-made APK has
 the original 2006 teams: the 2026 rosters are added when you build the APK yourself (below).
 
+## Mods
+
+**Mods** on the start screen adds other people's versions of game files: a `data.gob` with new rosters, kits,
+commentary in `Audio/`. Add a mod as a .zip laid out like the game folder (`Data/data.gob`, ...) or as a single game
+file. Each mod can be switched on and off or removed; your original files are set aside and come back. When two mods
+change the same file, the one added last wins. The app won't let a mod replace `cricket07.exe`, checks archives are
+complete before using them, and offers to switch mods off if the game doesn't reach its menu. For multiplayer both
+phones need the same mods.
+
 ## Or build it yourself
 
 You need Windows 10 or 11, [Python 3](https://www.python.org/downloads/) ("Add python.exe to PATH" ticked), about

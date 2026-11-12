@@ -211,6 +211,7 @@ public class TouchOverlay extends View {
                     invalidate();
                 }
                 if (p != 5) mFieldPreview = false;
+                if (p == 1) GameActivity.reachedMenu(getContext());
                 mPhase = p;
             }
             setLayout(mClassic ? L_PAD : phaseLayout());

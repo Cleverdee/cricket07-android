@@ -14,10 +14,8 @@ import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -58,7 +56,7 @@ public class SetupActivity extends Activity {
     private static final String EXE = "cricket07.exe";
     private static final int PICK_ZIP = 1, PICK_FOLDER = 2;
     private static final long SPARE_BYTES = 200L << 20;   /* left free after copying */
-    private static final int SOFT = Color.rgb(200, 220, 205), DIM = Color.rgb(150, 175, 160);
+    private static final int SOFT = Ui.SOFT, DIM = Ui.DIM;
 
     private LinearLayout mRoot;
     private TextView mStatus;
@@ -98,47 +96,19 @@ public class SetupActivity extends Activity {
     /* ------------------------------------------------------------------ screens */
 
     private void page() {
-        ScrollView sv = new ScrollView(this);
-        sv.setFillViewport(true);
-        sv.setBackgroundColor(Color.rgb(12, 28, 18));
-        mRoot = new LinearLayout(this);
-        mRoot.setOrientation(LinearLayout.VERTICAL);
-        mRoot.setGravity(Gravity.CENTER);
-        int pad = (int) (24 * mDp);
-        mRoot.setPadding(pad, pad, pad, pad);
-        sv.addView(mRoot);
-        setContentView(sv);
+        mRoot = Ui.page(this);
         mBar = null;
     }
 
-    private TextView text(String s, int size, int color) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(color);
-        t.setGravity(Gravity.CENTER);
-        t.setPadding(0, (int) (5 * mDp), 0, (int) (5 * mDp));
-        t.setMaxWidth((int) (560 * mDp));
-        mRoot.addView(t);
-        return t;
-    }
+    private TextView text(String s, int size, int color) { return Ui.text(mRoot, s, size, color); }
 
-    private Button button(String s, View.OnClickListener l) {
-        Button b = new Button(this);
-        b.setText(s);
-        b.setAllCaps(false);
-        b.setOnClickListener(l);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams((int) (340 * mDp), ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = (int) (8 * mDp);
-        mRoot.addView(b, lp);
-        return b;
-    }
+    private View button(String s, View.OnClickListener l) { return Ui.button(mRoot, s, l); }
 
     private void showWelcome() {
         mBusy = false;
         page();
         boolean have = hasGame();
-        text(getString(R.string.app_name), 28, Color.WHITE);
+        Ui.title(mRoot, "for Android");
         if (have) {
             text("Game files are installed.", 16, SOFT);
             button("Play", v -> startGame());
@@ -155,7 +125,7 @@ public class SetupActivity extends Activity {
 
     private void showHelp() {
         page();
-        text("Getting the game files", 24, Color.WHITE);
+        Ui.heading(mRoot, "Getting the game files");
         text("1. On your PC, open the folder Cricket 07 is installed in. It's usually\n"
            + "C:\\Program Files (x86)\\EA SPORTS\\Cricket 07\n"
            + "and has cricket07.exe and the Audio and Data folders in it.", 15, SOFT);
@@ -171,9 +141,13 @@ public class SetupActivity extends Activity {
 
     private void confirmDelete() {
         page();
-        text("Delete the game files?", 22, Color.WHITE);
+        Ui.heading(mRoot, "Delete the game files?");
         text("This frees about 1.2 GB. Your saves and settings stay, and you can add the files again later.", 15, SOFT);
-        button("Delete", v -> { deleteTree(gameDir()); showWelcome(); });
+        button("Delete", v -> {
+            try { Mods.sync(this, false); } catch (IOException e) { /* the game files go anyway; mods keep theirs */ }
+            deleteTree(gameDir());
+            showWelcome();
+        });
         button("Cancel", v -> showWelcome());
     }
 
@@ -181,7 +155,7 @@ public class SetupActivity extends Activity {
         mBusy = true;
         mCancel = false;
         page();
-        text(getString(R.string.app_name), 28, Color.WHITE);
+        Ui.title(mRoot, "for Android");
         mStatus = text(status, 16, SOFT);
         mBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         mBar.setMax(1000);
@@ -192,7 +166,7 @@ public class SetupActivity extends Activity {
     private void showError(String msg) {
         mBusy = false;
         page();
-        text("Couldn't add the game files", 22, Color.WHITE);
+        Ui.heading(mRoot, "Couldn't add the game files");
         text(msg, 15, SOFT);
         button("Try again", v -> showWelcome());
         button("How do I get the files?", v -> showHelp());
@@ -392,8 +366,10 @@ public class SetupActivity extends Activity {
         try (OutputStream out = new FileOutputStream(new File(root, IMPORTED))) { out.write(m.toString().getBytes("UTF-8")); }
 
         File dir = gameDir();
+        Mods.sync(this, false);   /* mods' files out of the old copy first, or they'd be deleted with it */
         deleteTree(dir);
         if (!root.renameTo(dir)) throw new IOException("couldn't move the files into place");
+        try { Mods.sync(this, true); } catch (IOException e) { /* the game runs without them */ }
         runOnUiThread(() -> {
             if (known) after.run();
             else showVersionWarning(after);
@@ -403,7 +379,7 @@ public class SetupActivity extends Activity {
     private void showVersionWarning(Runnable after) {
         mBusy = false;
         page();
-        text("A different version of the game", 22, Color.WHITE);
+        Ui.heading(mRoot, "A different version of the game");
         text("This cricket07.exe isn't the version this app was made from, so the game will probably not start. "
            + "The app works with the original PC release. Other versions can be made into an app on a PC with "
            + "Cricket07Builder.exe (see the project page).", 15, SOFT);
@@ -414,7 +390,7 @@ public class SetupActivity extends Activity {
     private void askDeleteSource(Uri uri, String name) {
         mBusy = false;
         page();
-        text("Game files added", 24, Color.WHITE);
+        Ui.heading(mRoot, "Game files added");
         text("You can delete " + (name.isEmpty() ? "the .zip" : name) + " now to free up space. The game doesn't need it any more.",
              15, SOFT);
         button("Delete it and play", v -> {

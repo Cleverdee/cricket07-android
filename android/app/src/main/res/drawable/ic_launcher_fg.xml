@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- launcher icon: a red ball inside a chrome ring (inside the 66 dp safe circle) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- chrome ring -->
+    <path android:fillColor="#00000000" android:strokeWidth="4.2"
+        android:pathData="M54,23.5a30.5,30.5 0,1 1,0 61a30.5,30.5 0,1 1,0 -61z">
+        <aapt:attr name="android:strokeColor">
+            <gradient android:type="linear" android:startX="30" android:startY="24" android:endX="78" android:endY="84">
+                <item android:offset="0" android:color="#FFFFFFFF" />
+                <item android:offset="0.35" android:color="#FF8C948E" />
+                <item android:offset="0.55" android:color="#FFF2F4F2" />
+                <item android:offset="1" android:color="#FF4A524C" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- ball -->
+    <path android:pathData="M54,30a24,24 0,1 1,0 48a24,24 0,1 1,0 -48z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="45" android:centerY="43" android:gradientRadius="34">
+                <item android:offset="0" android:color="#FFFF7A6E" />
+                <item android:offset="0.4" android:color="#FFD01E24" />
+                <item android:offset="1" android:color="#FF4E0408" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- seam: two stitched rows curving across the ball -->
+    <path android:strokeColor="#FFF6E7D2" android:strokeWidth="1.3" android:fillColor="#00000000" android:strokeLineCap="round"
+        android:pathData="M45.5,31.6C55.5,42 55.5,66 45.5,76.4M50.5,30.4C60.5,42 60.5,66 50.5,77.6" />
+    <path android:strokeColor="#CCF6E7D2" android:strokeWidth="0.9" android:fillColor="#00000000" android:strokeLineCap="round"
+        android:pathData="M48,35.5l2.8,-1.2M50,40.5l3,-0.8M51.2,46l3,-0.4M51.8,51.6l3,0M51.8,57.2l3,0.2M51.3,62.8l3,0.5M50.2,68.2l3,0.9M48.4,73.4l2.8,1.2" />
+    <!-- shine -->
+    <path android:fillColor="#55FFFFFF" android:pathData="M41,40a10,6 -35,1 1,8 -6a10,6 -35,1 1,-8 6z" />
+</vector>

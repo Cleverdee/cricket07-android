@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -64,17 +67,10 @@ public class MenuActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         mDp = getResources().getDisplayMetrics().density;
-        ScrollView sv = new ScrollView(this);
-        sv.setFillViewport(true);
-        sv.setBackgroundColor(Color.rgb(12, 28, 18));
-        mRoot = new LinearLayout(this);
-        mRoot.setOrientation(LinearLayout.VERTICAL);
-        mRoot.setGravity(Gravity.CENTER);
-        int pad = (int) (20 * mDp);
-        mRoot.setPadding(pad, pad, pad, pad);
-        sv.addView(mRoot);
-        setContentView(sv);
-        showMain();
+        mRoot = Ui.page(this);
+        /* mods were in and the game never reached its menu: offer to take them out */
+        if (Mods.launching(this).delete() && Mods.anyApplied(this)) showModTrouble();
+        else showMain();
     }
 
     @Override
@@ -92,38 +88,36 @@ public class MenuActivity extends Activity {
 
     /* ------------------------------------------------------------------ screens */
 
-    private TextView text(String s, int size, int color) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(color);
-        t.setGravity(Gravity.CENTER);
-        t.setPadding(0, (int) (6 * mDp), 0, (int) (6 * mDp));
-        mRoot.addView(t);
-        return t;
-    }
+    private TextView text(String s, int size, int color) { return Ui.text(mRoot, s, size, color); }
 
-    private Button button(String s, View.OnClickListener l) {
-        Button b = new Button(this);
-        b.setText(s);
-        b.setAllCaps(false);
-        b.setOnClickListener(l);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams((int) (320 * mDp), LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = (int) (8 * mDp);
-        mRoot.addView(b, lp);
-        return b;
+    private View button(String s, View.OnClickListener l) { return Ui.button(mRoot, s, l); }
+
+    private void showModTrouble() {
+        mStop = true;
+        Ui.clear(mRoot);
+        Ui.heading(mRoot, "The game didn't start");
+        text("Last time it closed before reaching the menu, with mods switched on. A mod may not suit this version "
+           + "of the game.", 15, Ui.SOFT);
+        button("Switch mods off", v -> {
+            java.util.List<Mods.Mod> mods = Mods.list(this);
+            for (Mods.Mod m : mods) m.on = false;
+            try { Mods.save(this, mods); Mods.sync(this, true); } catch (IOException e) { /* shown on the Mods screen */ }
+            showMain();
+        });
+        button("Keep them", v -> showMain());
     }
 
     private void showMain() {
         mStop = true;
-        mRoot.removeAllViews();
-        text(getString(R.string.app_name), 30, Color.WHITE);
+        Ui.clear(mRoot);
+        Ui.title(mRoot, "for Android");
         button("Play", v -> { startActivity(new Intent(this, GameActivity.class)); finish(); });
         button("Host a match", v -> showHost());
         button("Join a match", v -> showJoin());
-        text("Multiplayer: both phones on the same Wi-Fi, or one on the other's hotspot", 13, Color.rgb(170, 195, 180));
+        button("Mods", v -> { startActivity(new Intent(this, ModsActivity.class)); finish(); });
         if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
-            button("Game files", v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
+            Ui.button(mRoot, "Game files", true, v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
+        text("Multiplayer: both phones on the same Wi-Fi, or one on the other's hotspot", 12, Ui.DIM);
     }
 
     private boolean bundled() {
@@ -131,31 +125,31 @@ public class MenuActivity extends Activity {
     }
 
     private void showHost() {
-        mRoot.removeAllViews();
-        text("Hosting", 24, Color.WHITE);
+        Ui.clear(mRoot);
+        Ui.heading(mRoot, "Hosting");
         StringBuilder ips = new StringBuilder();
         for (InetAddress a : localAddresses()) ips.append(ips.length() > 0 ? "  or  " : "").append(a.getHostAddress());
-        text(ips.length() > 0 ? "This phone: " + ips : "No network: turn on Wi-Fi or your hotspot", 16, Color.rgb(200, 220, 205));
+        text(ips.length() > 0 ? "This phone: " + ips : "No network: turn on Wi-Fi or your hotspot", 16, Ui.SOFT);
         TextView status = text("Waiting for the other phone...", 16, Color.WHITE);
         button("Cancel", v -> { stopNet(); showMain(); });
         startNet(() -> hostLoop(status));
     }
 
     private void showJoin() {
-        mRoot.removeAllViews();
-        text("Join a match", 24, Color.WHITE);
+        Ui.clear(mRoot);
+        Ui.heading(mRoot, "Join a match");
         TextView status = text("Looking for matches on this network...", 16, Color.WHITE);
         LinearLayout found = new LinearLayout(this);
         found.setOrientation(LinearLayout.VERTICAL);
         found.setGravity(Gravity.CENTER);
-        mRoot.addView(found);
+        Ui.side(mRoot).addView(found);
         EditText ip = new EditText(this);
         ip.setHint("Or type the host's address");
         ip.setInputType(InputType.TYPE_CLASS_TEXT);
         ip.setTextColor(Color.WHITE);
-        ip.setHintTextColor(Color.rgb(150, 170, 155));
+        ip.setHintTextColor(Ui.DIM);
         ip.setGravity(Gravity.CENTER);
-        mRoot.addView(ip, new LinearLayout.LayoutParams((int) (320 * mDp), LinearLayout.LayoutParams.WRAP_CONTENT));
+        Ui.side(mRoot).addView(ip, new LinearLayout.LayoutParams((int) (300 * mDp), LinearLayout.LayoutParams.WRAP_CONTENT));
         final String[] target = { null };
         button("Join this address", v -> target[0] = ip.getText().toString().trim());
         button("Cancel", v -> { stopNet(); showMain(); });
@@ -166,9 +160,24 @@ public class MenuActivity extends Activity {
 
     /* ------------------------------------------------------------------ network */
 
+    /* Sends this app's traffic (the lobby here, and the game's own socket later, host/netplay_udp.c) over Wi-Fi.
+       When the Wi-Fi has no internet, which is usual on a phone's hotspot, Android sends it over mobile data
+       instead, and the other phone is never reached. A phone sharing its own hotspot has no Wi-Fi network:
+       hotspot clients are reached without binding. */
+    private void useWifi() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        Network wifi = null;
+        for (Network n : cm.getAllNetworks()) {
+            NetworkCapabilities c = cm.getNetworkCapabilities(n);
+            if (c != null && c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) wifi = n;
+        }
+        cm.bindProcessToNetwork(wifi);
+    }
+
     private void startNet(Runnable r) {
         stopNet();
         mStop = false;
+        useWifi();
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         mMulticast = wm.createMulticastLock("cricket07-lobby");   /* or some phones drop the broadcasts */
         mMulticast.acquire();
@@ -242,7 +251,7 @@ public class MenuActivity extends Activity {
                     if (f[2].equals(build)) peer = p.getAddress();
                     else {
                         send(s, "CK07X", p.getAddress(), p.getPort());
-                        ui(status, f[1] + " has a different version of the game: install the same APK on both phones");
+                        ui(status, f[1] + " has a different version: both phones need the same app, the same game files and the same mods");
                     }
                 }
             }
@@ -289,15 +298,28 @@ public class MenuActivity extends Activity {
             s.setSoTimeout(200);
             byte[] buf = new byte[512];
             InetAddress host = null;
-            long lastAsk = 0, lastJoin = 0;
+            long lastAsk = 0, lastJoin = 0, started = System.currentTimeMillis(), joinedAt = 0;
+            boolean hinted = false;
             for (;;) {
                 if (mStop) return;
                 long now = System.currentTimeMillis();
+                if (!hinted && hosts.isEmpty() && host == null && now - started > 8000) {
+                    hinted = true;
+                    ui(status, "No match found yet. Is the other phone on Host a match, on the same Wi-Fi? Some routers keep "
+                             + "phones apart: then turn on one phone's hotspot, join it with the other, and try again. "
+                             + "You can also type the address the host shows.");
+                }
+                if (host != null && joinedAt > 0 && now - joinedAt > 6000) {
+                    joinedAt = 0;
+                    ui(status, "No answer from that phone. Check the address, that it's on Host a match, and that both "
+                             + "phones are on the same network.");
+                }
                 if (target[0] != null && !target[0].isEmpty()) {
                     try { host = InetAddress.getByName(target[0]); }
                     catch (IOException e) { ui(status, "That address doesn't look right"); host = null; }
                     target[0] = null;
                     lastJoin = 0;
+                    joinedAt = System.currentTimeMillis();
                 }
                 if (host == null && now - lastAsk > 1000) {
                     lastAsk = now;
@@ -308,7 +330,7 @@ public class MenuActivity extends Activity {
                 if (host != null && now - lastJoin > 500) {
                     lastJoin = now;
                     send(s, "CK07J|" + Build.MODEL + "|" + build, host, LOBBY_PORT);
-                    ui(status, "Connecting...");
+                    if (joinedAt > 0) ui(status, "Connecting...");
                 }
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
                 try { s.receive(p); } catch (SocketTimeoutException e) { continue; }
@@ -320,19 +342,17 @@ public class MenuActivity extends Activity {
                     if (!hosts.containsKey(name)) {
                         hosts.put(name, from);
                         runOnUiThread(() -> {
-                            Button b = new Button(this);
-                            b.setAllCaps(false);
-                            b.setText(same ? "Join " + name : name + " (different version)");
+                            Ui.MenuButton b = Ui.button(found, same ? "Join " + name : name + " (different version)",
+                                                        v -> target[0] = from.getHostAddress());
                             b.setEnabled(same);
-                            b.setOnClickListener(v -> target[0] = from.getHostAddress());
-                            found.addView(b, new LinearLayout.LayoutParams((int) (320 * mDp), LinearLayout.LayoutParams.WRAP_CONTENT));
                         });
                         ui(status, "Found:");
                     }
                 } else if (f[0].equals("CK07X")) {
                     host = null;
-                    ui(status, "Different version: install the same APK on both phones");
+                    ui(status, "Different version: both phones need the same app, the same game files and the same mods");
                 } else if (f[0].equals("CK07P") && f.length >= 2) {
+                    joinedAt = 0;
                     send(s, "CK07Q|" + f[1], p.getAddress(), p.getPort());
                     ui(status, "Connected. Checking the connection...");
                 } else if (f[0].equals("CK07S") && f.length >= 3) {
@@ -348,20 +368,35 @@ public class MenuActivity extends Activity {
 
     /* ------------------------------------------------------------------ starting */
 
-    /* the game code and data together: lockstep needs identical copies */
+    /* The game code and the game's data: lockstep needs identical copies. The app's library, cricket07.exe and every
+       file in Data/ (path and size: a roster or kit mod changes them) count; the rest of the game folder doesn't. */
     private String buildId() {
         CRC32 crc = new CRC32();
         byte[] buf = new byte[1 << 16];
-        try (InputStream in = new FileInputStream(new File(getApplicationInfo().nativeLibraryDir, "libcricket07.so"))) {
-            for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
-        } catch (IOException e) { /* counted as a difference below */ }
-        try (InputStream in = getAssets().open("game_manifest.txt")) {
-            for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
-        } catch (IOException e) { /* a build without bundled files */ }
-        try (InputStream in = new FileInputStream(new File(getExternalFilesDir(null), "game/" + SetupActivity.IMPORTED))) {
-            for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
-        } catch (IOException e) { /* files copied in some other way: not compared */ }
+        File game = new File(getExternalFilesDir(null), "game");
+        for (File f : new File[] { new File(getApplicationInfo().nativeLibraryDir, "libcricket07.so"), new File(game, "cricket07.exe") }) {
+            try (InputStream in = new FileInputStream(f)) {
+                for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
+            } catch (IOException e) { crc.update(0); }
+        }
+        File data = null;
+        File[] kids = game.listFiles();
+        if (kids != null) for (File k : kids) if (k.isDirectory() && k.getName().equalsIgnoreCase("Data")) data = k;
+        List<String> list = new ArrayList<>();
+        if (data != null) listFiles(data, "", list);
+        Collections.sort(list);
+        for (String s : list) crc.update(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         return Long.toHexString(crc.getValue());
+    }
+
+    private static void listFiles(File dir, String rel, List<String> out) {
+        File[] kids = dir.listFiles();
+        if (kids == null) return;
+        for (File k : kids) {
+            String p = rel + k.getName().toLowerCase(java.util.Locale.US);
+            if (k.isDirectory()) listFiles(k, p + "/", out);
+            else out.add(p + "|" + k.length() + ";");
+        }
     }
 
     private void launch(int slot, InetAddress peer, int session, int delay) {
