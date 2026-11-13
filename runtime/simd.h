@@ -10,7 +10,7 @@ static inline int64_t v_get(const uint8_t *p, int lane, int sgn) {
     switch (lane) {
     case 1: return sgn ? (int8_t)p[0] : p[0];
     case 2: { uint16_t v; memcpy(&v, p, 2); return sgn ? (int16_t)v : v; }
-    case 4: { uint32_t v; memcpy(&v, p, 4); return sgn ? (int32_t)v : v; }
+    case 4: { uint32_t v; memcpy(&v, p, 4); return sgn ? (int64_t)(int32_t)v : (int64_t)v; }
     default: { uint64_t v; memcpy(&v, p, 8); return (int64_t)v; }
     }
 }

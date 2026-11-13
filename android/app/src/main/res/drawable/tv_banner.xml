@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android TV home screen banner: the launcher backdrop with the ball and ring -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@drawable/ic_launcher_bg" />
+    <item android:drawable="@drawable/ic_launcher_fg" android:gravity="center" android:width="180dp" android:height="180dp" />
+</layer-list>

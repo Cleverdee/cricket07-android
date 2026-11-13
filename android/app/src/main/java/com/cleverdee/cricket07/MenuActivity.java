@@ -163,6 +163,25 @@ public class MenuActivity extends Activity {
         if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
             Ui.button(mRoot, "Game files", true, v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
         text("Multiplayer: both phones on the same Wi-Fi, or one on the other's hotspot", 12, Ui.DIM);
+        Ui.button(mRoot, "Check for updates", true, v -> { startActivity(new Intent(this, UpdateActivity.class)); finish(); });
+        if (sUpdate != null) showUpdateNote();
+        else if (!sChecked && UpdateActivity.due(this)) {   /* quietly, at most once a day */
+            sChecked = true;
+            new Thread(() -> {
+                try {
+                    UpdateActivity.Release r = UpdateActivity.check(this);
+                    if (r != null) runOnUiThread(() -> { sUpdate = r; if (mStop) showUpdateNote(); });
+                } catch (java.io.IOException e) { /* offline: try another day */ }
+            }, "update-check").start();
+        }
+    }
+
+    private static UpdateActivity.Release sUpdate;   /* found by the quiet check */
+    private static boolean sChecked;
+
+    private void showUpdateNote() {
+        TextView t = text("Version " + sUpdate.version + " is available: tap Check for updates", 14, Ui.GREEN);
+        t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
     }
 
     private boolean bundled() {

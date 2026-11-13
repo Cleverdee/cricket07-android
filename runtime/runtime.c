@@ -344,10 +344,11 @@ int load_image(const char *path, LoadedImage *out) {
             g_nimports++;
         }
     }
+    uint32_t image_size = rd32(opt + 56);   /* SizeOfImage: read before the file buffer (opt points into it) is freed */
     free(file);
     out->image_base = image_base;
     g_image_lo = image_base;
-    g_image_hi = image_base + rd32(opt + 56);   /* SizeOfImage */
+    g_image_hi = image_base + image_size;
     out->entry = image_base + entry;
     out->num_imports = g_nimports;
     return 0;

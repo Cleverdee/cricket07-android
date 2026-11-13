@@ -57,9 +57,25 @@ static int autoplaying(void) { return R8(0x007edd8cu) != 0; }
    the ball is in play */
 static int bowler_aiming(void) { return R32(0x007edd14u) == 1; }
 
+/* Training nets have no scoreboard: only one of the match HUD textures (17510c8c) is drawn, so they looked like
+   a cut-scene and the touch controls showed only Skip. Bowling nets draw the delivery-camera set while a delivery
+   is chosen or aimed; batting nets draw the shot-timing bar (8bd222e3 2D, e3b09cd3), which matches don't. The side
+   is remembered between balls, and forgotten when a match scoreboard is back. */
+static int g_nets_side;   /* 0 not known, 1 batting, 2 bowling */
+
+static int nets(const uint32_t *h, uint32_t n) {
+    if (!has(h, n, 0x17510c8cu) || autoplaying()) { g_nets_side = 0; return 0; }
+    if (delivery(h, n) || bowler_aiming()) g_nets_side = 2;
+    else if (has(h, n, 0x8bd222e3u) || has(h, n, 0xe3b09cd3u)) g_nets_side = 1;
+    return g_nets_side == 2 ? (bowler_aiming() ? PH_BOWL_AIM : PH_BOWL_DELIVERY)
+         : g_nets_side == 1 ? PH_BAT_DELIVERY : 0;
+}
+
 static int classify(const uint32_t *h, uint32_t n) {
     if (has(h, n, 0x168da0b7u)) return PH_MENU;
-    if (!hud(h, n) || autoplaying()) return PH_SCENE;
+    if (!hud(h, n)) { int p = nets(h, n); return p ? p : PH_SCENE; }
+    g_nets_side = 0;
+    if (autoplaying()) return PH_SCENE;
     int d = delivery(h, n);
     if (player_bowling()) return bowler_aiming() ? PH_BOWL_AIM : d ? PH_BOWL_DELIVERY : PH_BOWL_BALL;
     return d ? PH_BAT_DELIVERY : PH_BAT_BALL;

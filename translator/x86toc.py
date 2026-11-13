@@ -385,6 +385,10 @@ class FunctionTranslator:
         self.insn_addrs = {i.address for i in insns}
         body = []
         unsupported = []
+        if insns and insns[0].address != self.entry:
+            # code below the entry (merged tail-jump target): start at the entry
+            self.cur = self.entry
+            body.append((None, self.target_stmt(self.entry)))
         for k, ins in enumerate(insns):
             self.cur = ins.address
             try:
