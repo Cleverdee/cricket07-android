@@ -312,10 +312,11 @@ public class MenuActivity extends Activity {
                 String[] f = new String(p.getData(), 0, p.getLength(), "UTF-8").split("\\|");
                 if (f[0].equals("CK07?")) send(s, "CK07!|" + Build.MODEL + "|" + build, p.getAddress(), p.getPort());
                 else if (f[0].equals("CK07J") && f.length >= 3) {
-                    if (f[2].equals(build)) peer = p.getAddress();
+                    String why = mismatch(build, f[2]);
+                    if (why == null) peer = p.getAddress();
                     else {
-                        send(s, "CK07X", p.getAddress(), p.getPort());
-                        ui(status, f[1] + " has a different version: both phones need the same app, the same game files and the same mods");
+                        send(s, "CK07X|" + why, p.getAddress(), p.getPort());
+                        ui(status, "Can't play with " + f[1] + ": " + why);
                     }
                 }
             }
@@ -402,7 +403,9 @@ public class MenuActivity extends Activity {
                 if (f[0].equals("CK07!") && f.length >= 3 && host == null) {
                     final String name = f[1];
                     final InetAddress from = p.getAddress();
-                    final boolean same = f[2].equals(build);
+                    final String why = mismatch(build, f[2]);
+                    final boolean same = why == null;
+                    if (!same) ui(status, "Can't play with " + name + ": " + why);
                     if (!hosts.containsKey(name)) {
                         hosts.put(name, from);
                         runOnUiThread(() -> {
@@ -410,11 +413,11 @@ public class MenuActivity extends Activity {
                                                         v -> target[0] = from.getHostAddress());
                             b.setEnabled(same);
                         });
-                        ui(status, "Found:");
+                        if (same) ui(status, "Found:");
                     }
                 } else if (f[0].equals("CK07X")) {
                     host = null;
-                    ui(status, "Different version: both phones need the same app, the same game files and the same mods");
+                    ui(status, "Can't play with that phone: " + (f.length >= 2 ? f[1] : "it has a different version"));
                 } else if (f[0].equals("CK07P") && f.length >= 2) {
                     joinedAt = 0;
                     send(s, "CK07Q|" + f[1], p.getAddress(), p.getPort());
@@ -432,32 +435,55 @@ public class MenuActivity extends Activity {
 
     /* ------------------------------------------------------------------ starting */
 
-    /* The game code and the game's data: lockstep needs identical copies. The app's library, cricket07.exe and every
-       file in Data/ (path and size: a roster or kit mod changes them) count; the rest of the game folder doesn't. */
+    /* The game code and the game's data: lockstep needs identical copies. Three parts, so a mismatch can say which:
+       the app (version and library), cricket07.exe, and every file in Data/ (path and size: a roster or kit mod changes
+       them). Files the game never reads (Thumbs.db, desktop.ini, macOS ._ files, picked up when the files were copied
+       on a PC or Mac) don't count: two copies of the same game used to look different because of them. */
     private String buildId() {
-        CRC32 crc = new CRC32();
-        byte[] buf = new byte[1 << 16];
         File game = new File(getExternalFilesDir(null), "game");
-        for (File f : new File[] { new File(getApplicationInfo().nativeLibraryDir, "libcricket07.so"), new File(game, "cricket07.exe") }) {
-            try (InputStream in = new FileInputStream(f)) {
-                for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
-            } catch (IOException e) { crc.update(0); }
-        }
+        CRC32 app = new CRC32();
+        app.update(String.valueOf(BuildConfig.VERSION_CODE).getBytes());
+        crcFile(app, new File(getApplicationInfo().nativeLibraryDir, "libcricket07.so"));
+        CRC32 exe = new CRC32();
+        crcFile(exe, new File(game, "cricket07.exe"));
         File data = null;
         File[] kids = game.listFiles();
         if (kids != null) for (File k : kids) if (k.isDirectory() && k.getName().equalsIgnoreCase("Data")) data = k;
         List<String> list = new ArrayList<>();
         if (data != null) listFiles(data, "", list);
         Collections.sort(list);
-        for (String s : list) crc.update(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        return Long.toHexString(crc.getValue());
+        CRC32 dat = new CRC32();
+        for (String x : list) dat.update(x.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return Long.toHexString(app.getValue()) + "." + Long.toHexString(exe.getValue()) + "." + Long.toHexString(dat.getValue());
+    }
+
+    private static void crcFile(CRC32 crc, File f) {
+        byte[] buf = new byte[1 << 16];
+        try (InputStream in = new FileInputStream(f)) {
+            for (int n; (n = in.read(buf)) > 0; ) crc.update(buf, 0, n);
+        } catch (IOException e) { crc.update(0); }
+    }
+
+    /* null when the two phones can play together, else what differs, in words a player can act on */
+    static String mismatch(String mine, String theirs) {
+        if (mine.equals(theirs)) return null;
+        String[] a = mine.split("\\."), b = theirs.split("\\.");
+        if (b.length != 3 || !a[0].equals(b[0])) return "the two phones have different app versions. Update both (Check for updates).";
+        if (!a[1].equals(b[1])) return "the game files are from different versions of Cricket 07 (cricket07.exe differs). Import the same copy on both phones.";
+        return "the game's Data files differ. Turn off mods on both phones (or use the same ones), or import the same copy of the game on both.";
+    }
+
+    private static boolean junk(String name) {
+        return name.startsWith(".") || name.equals("thumbs.db") || name.equals("desktop.ini") || name.equals("__macosx");
     }
 
     private static void listFiles(File dir, String rel, List<String> out) {
         File[] kids = dir.listFiles();
         if (kids == null) return;
         for (File k : kids) {
-            String p = rel + k.getName().toLowerCase(java.util.Locale.US);
+            String n = k.getName().toLowerCase(java.util.Locale.US);
+            if (junk(n)) continue;
+            String p = rel + n;
             if (k.isDirectory()) listFiles(k, p + "/", out);
             else out.add(p + "|" + k.length() + ";");
         }
