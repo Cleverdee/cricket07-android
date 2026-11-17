@@ -32,6 +32,23 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         return new GameSurface(context);
     }
 
+    /* Resolution presets (the start screen's Resolution button): the height the game renders at, before the display
+       scales it to the screen (host/render_wgpu.c, RC_RENDER_HEIGHT; 0 = the screen's own). Lower is faster. */
+    private static final int[] RES = { 540, 720, 900, 1080, 0 };
+    private static final String[] RES_NAME = { "540p: fastest", "720p: default", "900p", "1080p", "Full: the screen's own" };
+
+    private static int resIndex(Context c) {
+        int h = c.getSharedPreferences("app", Context.MODE_PRIVATE).getInt("render_height", 720);
+        for (int i = 0; i < RES.length; i++) if (RES[i] == h) return i;
+        return 1;
+    }
+    static int resolution(Context c) { return RES[resIndex(c)]; }
+    static String resolutionName(Context c) { return RES_NAME[resIndex(c)]; }
+    static void nextResolution(Context c) {
+        c.getSharedPreferences("app", Context.MODE_PRIVATE).edit()
+         .putInt("render_height", RES[(resIndex(c) + 1) % RES.length]).apply();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         /* a Java crash goes in the crash report too (the native side writes its own, host/window_android.c) */
@@ -42,6 +59,8 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
             catch (java.io.IOException io) { /* no report then */ }
             if (prev != null) prev.uncaughtException(t, e);
         });
+        try { android.system.Os.setenv("RC_RENDER_HEIGHT", String.valueOf(resolution(this)), true); }
+        catch (android.system.ErrnoException e) { /* the default then */ }
         super.onCreate(savedInstanceState);
         sRunning = true;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

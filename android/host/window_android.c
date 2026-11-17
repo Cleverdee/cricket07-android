@@ -355,19 +355,21 @@ static const int g_std_for_raw[12] = { 2, 0, 1, 3, 4, 5, 6, 7, 9, 8, 10, 11 };
 
 /* the touch pad: written by the UI thread, applied on the event thread */
 static volatile uint32_t g_touch_buttons;
-static volatile int g_touch_lx, g_touch_ly;
+static volatile int g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry;
 
 static void touch_report(void) {
     if (g_joy[0]) return;   /* a physical controller has pad 0 */
-    input_gamepad(0, 1, g_touch_buttons | g_touch_esc, g_touch_lx, g_touch_ly, 0, 0);
+    input_gamepad(0, 1, g_touch_buttons | g_touch_esc, g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry);
 }
 
 JNIEXPORT void JNICALL Java_com_cleverdee_cricket07_TouchOverlay_nativeTouchPad(JNIEnv *env, jclass cls,
-                                                                                  jint buttons, jint lx, jint ly) {
+                                                                                  jint buttons, jint lx, jint ly, jint rx, jint ry) {
     (void)env; (void)cls;
     g_touch_buttons = (uint32_t)buttons;
     g_touch_lx = lx;
     g_touch_ly = ly;
+    g_touch_rx = rx;
+    g_touch_ry = ry;
     g_touch_dirty = 1;
     SDL_Event e = { 0 };
     e.type = SDL_USEREVENT;   /* wake the event loop */

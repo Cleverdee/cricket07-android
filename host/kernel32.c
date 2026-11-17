@@ -121,6 +121,13 @@ W(GetCurrentThreadId) { RET(0, t_self ? t_self->id : 0x100); }
 W(GetLastError) { RET(0, t_self ? t_self->last_error : 0); }
 W(SetLastError) { set_error(ARG(0)); RET(1, 0); }
 
+/* Leave without running exit()'s library teardown: on Android it destroys C++ globals while the system's UI render
+   thread still uses them, and that thread then aborts (a "crash" report after the player quit from the menu). */
+void host_quit(int code) {
+    fflush(NULL);
+    _exit(code);
+}
+
 W(ExitProcess) {
     fprintf(stderr, "[kernel32] ExitProcess(%d) from thread %u, stack:", (int)ARG(0), t_self ? t_self->id : 0);
     for (int k = 0, n = 0; k < 4096 && n < 32; k++) {
@@ -137,15 +144,15 @@ W(ExitProcess) {
         while (len < 120 && p[len] >= 0x20 && p[len] < 0x7f) len++;
         if (len >= 6 && (p[len] == 0 || p[len] == '\n')) { fprintf(stderr, "    \"%.*s\"\n", len, (const char *)p); n++; }
     }
-    exit((int)ARG(0));
+    host_quit((int)ARG(0));
 }
 W(TerminateProcess) {
     fprintf(stderr, "[kernel32] TerminateProcess(%d)\n", (int)ARG(1));
-    exit((int)ARG(1));
+    host_quit((int)ARG(1));
 }
 W(FatalAppExitA) {
     fprintf(stderr, "[kernel32] FatalAppExit: %s\n", GSTR(ARG(1)));
-    exit(3);
+    host_quit(3);
 }
 
 W(GetSystemInfo) {

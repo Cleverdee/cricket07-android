@@ -160,6 +160,9 @@ public class MenuActivity extends Activity {
         button("Host a match", v -> showHost());
         button("Join a match", v -> showJoin());
         button("Mods", v -> { startActivity(new Intent(this, ModsActivity.class)); finish(); });
+        Ui.MenuButton res = Ui.button(mRoot, "Resolution", true, null);   /* tap to cycle the presets */
+        res.setNote(GameActivity.resolutionName(this));
+        res.setOnClickListener(v -> { GameActivity.nextResolution(this); res.setNote(GameActivity.resolutionName(this)); });
         if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
             Ui.button(mRoot, "Game files", true, v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
         text("Multiplayer: both phones on the same Wi-Fi, or one on the other's hotspot", 12, Ui.DIM);

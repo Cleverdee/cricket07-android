@@ -18,7 +18,7 @@
  * gamephase_dump() writes a frame's set (with the snapshot hook in d3d8.c) for finding new ones. */
 #include "win32.h"
 
-enum { PH_UNKNOWN, PH_MENU, PH_SCENE, PH_BAT_DELIVERY, PH_BAT_BALL, PH_BOWL_DELIVERY, PH_BOWL_BALL, PH_BOWL_AIM };
+enum { PH_UNKNOWN, PH_MENU, PH_SCENE, PH_BAT_DELIVERY, PH_BAT_BALL, PH_BOWL_DELIVERY, PH_BOWL_BALL, PH_BOWL_AIM, PH_BOWL_WAIT };
 
 static volatile int g_phase;   /* PH_*, read by the overlay (android/host/window_android.c) */
 
@@ -71,24 +71,62 @@ static int nets(const uint32_t *h, uint32_t n) {
          : g_nets_side == 1 ? PH_BAT_DELIVERY : 0;
 }
 
+/* Is the ball live? The match view looks the same while the ball is in play and in the gap before the next
+   delivery is set up (after a replay, a menu or the end of an over the game shows the bowler-to-batsman caption
+   for a while), so the texture set alone can't tell them apart. The game's own sequence can: the ball goes live
+   when the bowler lets it go (bowler_aiming 1 -> 0) and is dead again once a menu, cut-scene or replay shows, a
+   new delivery is set up, or the delivery view is back well after the release. */
+static int g_live, g_prev_aim, g_since_release;
+
+static void track_ball(int menu_or_scene, int d) {
+    int aim = bowler_aiming();
+    if (g_prev_aim && !aim) { g_live = 1; g_since_release = 0; }
+    g_prev_aim = aim;
+    g_since_release++;
+    if (aim || menu_or_scene || (d && g_since_release > 30)) g_live = 0;
+}
+
 static int classify(const uint32_t *h, uint32_t n) {
-    if (has(h, n, 0x168da0b7u)) return PH_MENU;
-    if (!hud(h, n)) { int p = nets(h, n); return p ? p : PH_SCENE; }
+    if (has(h, n, 0x168da0b7u)) { track_ball(1, 0); return PH_MENU; }
+    if (!hud(h, n)) { track_ball(1, 0); int p = nets(h, n); return p ? p : PH_SCENE; }
     g_nets_side = 0;
-    if (autoplaying()) return PH_SCENE;
     int d = delivery(h, n);
-    if (player_bowling()) return bowler_aiming() ? PH_BOWL_AIM : d ? PH_BOWL_DELIVERY : PH_BOWL_BALL;
+    track_ball(autoplaying(), d);
+    if (autoplaying()) return PH_SCENE;
+    /* bowling, no delivery under way and the ball not live: the gap before the next delivery. No controls then:
+       a press there used to reach the game as something else (Field, or a delivery chosen too early). */
+    if (player_bowling()) return bowler_aiming() ? PH_BOWL_AIM : d ? PH_BOWL_DELIVERY : g_live ? PH_BOWL_BALL : PH_BOWL_WAIT;
     return d ? PH_BAT_DELIVERY : PH_BAT_BALL;
 }
 
 /* A phase must hold for a few frames before it is reported, so single odd frames (fades, the first
    frame of a camera cut) don't flip the controls. */
 #define PHASE_HOLD 5
+/* RC_WATCH=addr,addr,... (hex): logs each byte's changes with the frame's phase, for finding game-state flags */
+static void watch(int p) {
+    static int n = -1; static uint32_t addr[16]; static uint8_t last[16]; static unsigned frame;
+    frame++;
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("RC_WATCH");
+        while (e && *e && n < 16) { addr[n++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; }
+        for (int i = 0; i < n; i++) last[i] = R8(addr[i]);
+    }
+    for (int i = 0; i < n; i++) {
+        uint8_t v = R8(addr[i]);
+        if (v != last[i]) { fprintf(stderr, "[watch] f%u ph%d %08x %u -> %u\n", frame, p, addr[i], last[i], v); last[i] = v; }
+    }
+}
+
 void gamephase_frame(const uint32_t *hashes, uint32_t n) {
     static int candidate, count;
     int p = classify(hashes, n);
+    watch(p);
     if (p != candidate) { candidate = p; count = 0; }
-    if (++count >= PHASE_HOLD) g_phase = p;
+    if (++count >= PHASE_HOLD && g_phase != p) {
+        if (getenv("RC_LOG_PHASE")) fprintf(stderr, "[phase] %d -> %d\n", g_phase, p);
+        g_phase = p;
+    }
 }
 
 int gamephase_current(void) { return g_phase; }

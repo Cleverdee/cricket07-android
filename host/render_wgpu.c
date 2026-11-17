@@ -353,12 +353,9 @@ static void configure_surface(void) {
 #ifdef __ANDROID__
     /* Phone GPUs are slow and screens dense: render a smaller swap chain and let the display hardware
        scale it up, which costs nothing. RC_RENDER_HEIGHT sets its height (default 720; 0 = native). */
-    static int render_h = -1;
-    if (render_h < 0) {
-        const char *e = getenv("RC_RENDER_HEIGHT");
-        render_h = e ? atoi(e) : 720;
-        if (render_h < 0) render_h = 0;
-    }
+    const char *rh = getenv("RC_RENDER_HEIGHT");   /* the app's Resolution preset */
+    int render_h = rh ? atoi(rh) : 720;
+    if (render_h < 0) render_h = 0;
     if (render_h >= 240 && render_h < g_win_h) {
         g_win_w = (int)((int64_t)g_win_w * render_h / g_win_h) & ~1;
         g_win_h = render_h;

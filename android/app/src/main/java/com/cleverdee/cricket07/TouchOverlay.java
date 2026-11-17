@@ -34,12 +34,13 @@ import android.view.View;
    Bits are the W3C standard layout used by host/input.c. The game sees a "Logitech Dual Action": A = its
    bottom button (Cross), B = right (Circle), X = left (Square), Y = top (Triangle), LB/RB = L1/R1.
    Game actions, from its controller settings screens and loading tips: batting Y shot, A second shot,
-   B advance, X leave, LB (held) lofted, stick direction; running B run, A stop, Y dive; bowling delivery
+   B advance, X leave, LB (held) lofted, stick direction; running B run, X cancel the run (the leave button: the game's "Running Between Wickets" tip;
+   A there is "slide bat", co-op only, which is why Stop on A did nothing), Y dive; bowling delivery
    N = pad button N (1 X, 2 A, 3 B, 4 Y, 5 LB, 6 RB, 7 LT, 8 RT), d-pad left/right side of the wicket, up/down field;
    aiming A lock, X set, B fake, stick aim and swing; fielding (semi-auto) Y keeper's end, A bowler's end,
    with a modifier (RB) for a direct hit; menus A select, Y back. */
 public class TouchOverlay extends View {
-    static native void nativeTouchPad(int buttons, int lx, int ly);
+    static native void nativeTouchPad(int buttons, int lx, int ly, int rx, int ry);
     static native void nativeTouchMouse(int button, int dx, int dy);   /* button: -1 none, 0 up, 1 down */
     static native int nativeFps();
     static native int nativeGamePhase();   /* host/gamephase.c PH_*: see phaseLayout() */
@@ -54,11 +55,11 @@ public class TouchOverlay extends View {
 
     static final int L_MENU = 0, L_BAT = 1, L_RUN = 2, L_CHOOSE = 3, L_AIM = 4, L_FIELD = 5, L_SCENE = 6, L_FIELDSET = 7,
                      L_DYN = 8,   /* the dynamic layouts are 0..L_DYN-1 */
-                     L_PAD = 8, L_N = 9;
+                     L_PAD = 8, L_WAIT = 9, L_N = 10;   /* L_WAIT: no buttons, the gap before a delivery */
     static final String[] LAYOUT_NAMES = { "Menu", "Batting", "Running", "Bowling: choose", "Bowling: aim",
                                            "Fielding", "Cut-scene", "Bowling: field", "Classic controller" };
-    private static final boolean[] HAS_STICK = { true, true, false, false, true, true, false, false, true };
-    private static final boolean[] HAS_TOUCHPAD = { true, false, false, false, false, false, true, false, false };
+    private static final boolean[] HAS_STICK = { true, true, false, false, true, true, false, false, true, false };
+    private static final boolean[] HAS_TOUCHPAD = { true, false, false, false, false, false, true, false, false, false };
 
     static final int I_CHECK = 1, I_BACK = 2, I_BAT = 3, I_LOFT = 4, I_RUN = 5, I_HAND = 6, I_DIVE = 7, I_SIDE = 8,
             I_FIELD = 9, I_LOCK = 10, I_TARGET = 11, I_FAKE = 12, I_UP = 13, I_DOWN = 14, I_DIRECT = 15, I_SKIP = 16,
@@ -94,7 +95,7 @@ public class TouchOverlay extends View {
           Lf("loft", "Loft", I_LOFT, LB, F_TOGGLE, 1.35f, 5.1f, 0.58f),
           R("mleft", "Left", I_LEFT, -1, F_MOVE_LEFT, 2.5f, 5.4f, 0.55f),
           R("mright", "Right", I_RIGHT, -1, F_MOVE_RIGHT, 1.1f, 5.4f, 0.55f) },
-        { /* running */ R("run", "Run", I_RUN, B, 0, 1.65f, 1.65f, 0.9f), R("stop", "Stop", I_HAND, A, 0, 3.45f, 1.45f, 0.62f),
+        { /* running */ R("run", "Run", I_RUN, B, 0, 1.65f, 1.65f, 0.9f), R("stop", "Stop", I_HAND, X, 0, 3.45f, 1.45f, 0.62f),
           R("dive", "Dive", I_DIVE, Y, 0, 1.6f, 3.7f, 0.52f) },
         { /* bowling: choose - the game's delivery panel order, top to bottom */
           R("d2", "2", I_NUMBER, A, F_DELIVERY, 0.9f, 7.3f, 0.52f), R("d1", "1", I_NUMBER, X, F_DELIVERY, 0.9f, 5.9f, 0.52f),
@@ -117,6 +118,7 @@ public class TouchOverlay extends View {
           Lf("pl1", "L1", I_NUMBER, LB, 0, 1.1f, 6.5f, 0.48f), Lf("pl2", "L2", I_NUMBER, LT, 0, 2.5f, 6.5f, 0.48f),
           Lf("pup", "", I_UP, DUP, 0, 1.9f, 5.05f, 0.42f), Lf("pdown", "", I_DOWN, DDOWN, 0, 1.9f, 3.55f, 0.42f),
           Lf("pleft", "", I_LEFT, DLEFT, 0, 1.15f, 4.3f, 0.42f), Lf("pright", "", I_RIGHT, DRIGHT, 0, 2.65f, 4.3f, 0.42f) },
+        { /* waiting for the next delivery (bowling): nothing to press */ },
     };
     /* on every layout: pause (Start) and the settings gear, top left */
     private final Btn[] mGlobal = {
@@ -145,6 +147,11 @@ public class TouchOverlay extends View {
     private static final long MIN_HOLD_MS = 100;   /* a quick tap must last a few game frames to be seen */
     private int mStickPointer = -1;
     private float mStickCx, mStickCy, mStickX, mStickY, mStickRadius;
+    /* Batting: a right stick, for the game's analog batting (My Cricket > controller settings > Analog 1/2, "use the
+       left and right analog sticks"). A touch on the right half that misses the buttons; with Classic batting the
+       game ignores it. */
+    private int mRStickPointer = -1;
+    private float mRStickCx, mRStickCy, mRStickX, mRStickY;
     /* Off-button touches on the game picture in menus and cut-scenes are a touchpad for the game's mouse
        cursor (the title screen and some menus only take clicks): drag moves the cursor, a tap clicks. */
     private int mMousePointer = -1;
@@ -153,7 +160,7 @@ public class TouchOverlay extends View {
     private long mMouseDownAt;
     private final Runnable mMouseRelease = () -> nativeTouchMouse(0, 0, 0);
     private boolean mHidden, mPadConnected;
-    private int mSentButtons = -1, mSentX, mSentY;
+    private int mSentButtons = -1, mSentX, mSentY, mSentRX, mSentRY;
     private final Paint mFill = new Paint(Paint.ANTI_ALIAS_FLAG), mLine = new Paint(Paint.ANTI_ALIAS_FLAG),
                         mText = new Paint(Paint.ANTI_ALIAS_FLAG), mIcon = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path mPath = new Path();
@@ -232,6 +239,7 @@ public class TouchOverlay extends View {
         case 5: return mFieldPreview ? L_FIELDSET : L_CHOOSE;
         case 6: return L_FIELD;
         case 7: return L_AIM;
+        case 8: return L_WAIT;   /* bowling: waiting for the next delivery to be set up */
         default: return L_MENU;
         }
     }
@@ -241,7 +249,7 @@ public class TouchOverlay extends View {
         mLayout = l;
         mHeld.clear();
         mPending.clear();
-        mStickPointer = -1;
+        mStickPointer = -1; mRStickPointer = -1;
         mMousePointer = -1;
         mCursorKnown = false;   /* the game may have moved or recentred the cursor */
         mFadeStart = SystemClock.uptimeMillis();
@@ -255,7 +263,7 @@ public class TouchOverlay extends View {
         mHidden = connected;
         mHeld.clear();
         mPending.clear();
-        mStickPointer = -1;
+        mStickPointer = -1; mRStickPointer = -1;
         mEdit = false;
         mSettings = false;
         if (!connected) send();   /* back to touch: report the released state */
@@ -360,6 +368,10 @@ public class TouchOverlay extends View {
                 mStickPointer = id;   /* the stick appears where the thumb lands */
                 mStickCx = mStickX = x;
                 mStickCy = mStickY = y;
+            } else if (mLayout == L_BAT && x >= getWidth() / 2f && mRStickPointer < 0) {
+                mRStickPointer = id;
+                mRStickCx = mRStickX = x;
+                mRStickCy = mRStickY = y;
             } else if (hasTouchpad() && inGame(x) && mMousePointer < 0) {
                 mMousePointer = id;
                 mMouseRestX = x;
@@ -375,6 +387,7 @@ public class TouchOverlay extends View {
                 int id = e.getPointerId(i);
                 float x = e.getX(i), y = e.getY(i);
                 if (id == mStickPointer) { mStickX = x; mStickY = y; }
+                else if (id == mRStickPointer) { mRStickX = x; mRStickY = y; }
                 else if (id == mMousePointer) {
                     float slop = 12 * mDp;
                     if (!mMouseMoved && Math.abs(x - mMouseRestX) < slop && Math.abs(y - mMouseRestY) < slop) continue;
@@ -386,11 +399,12 @@ public class TouchOverlay extends View {
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_POINTER_UP:
         case MotionEvent.ACTION_CANCEL: {
-            if (action == MotionEvent.ACTION_CANCEL) { mHeld.clear(); mStickPointer = -1; mMousePointer = -1; break; }
+            if (action == MotionEvent.ACTION_CANCEL) { mHeld.clear(); mStickPointer = -1; mRStickPointer = -1; mMousePointer = -1; break; }
             int id = e.getPointerId(idx);
             Btn b = mHeld.get(id);
             if (b != null) release(id, b);
             if (id == mStickPointer) mStickPointer = -1;
+            if (id == mRStickPointer) mRStickPointer = -1;
             if (id == mMousePointer) {
                 mMousePointer = -1;
                 if (!mMouseMoved && e.getEventTime() - mMouseDownAt < 500) {   /* a tap: click where it landed */
@@ -517,9 +531,15 @@ public class TouchOverlay extends View {
                 if ((b.flags & F_MOVE_RIGHT) != 0 && isHeld(b)) lx += 32767;
             }
         }
-        if (buttons == mSentButtons && lx == mSentX && ly == mSentY) return;
-        mSentButtons = buttons; mSentX = lx; mSentY = ly;
-        nativeTouchPad(buttons, lx, ly);
+        int rx = 0, ry = 0;
+        if (mRStickPointer >= 0 && !off) {
+            float dx = mRStickX - mRStickCx, dy = mRStickY - mRStickCy;
+            float len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len >= STICK_DEADZONE * mStickRadius) { rx = stickAxis(dx); ry = stickAxis(dy); }
+        }
+        if (buttons == mSentButtons && lx == mSentX && ly == mSentY && rx == mSentRX && ry == mSentRY) return;
+        mSentButtons = buttons; mSentX = lx; mSentY = ly; mSentRX = rx; mSentRY = ry;
+        nativeTouchPad(buttons, lx, ly, rx, ry);
     }
 
     /* ------------------------------------------------------------------ settings */
@@ -528,7 +548,7 @@ public class TouchOverlay extends View {
         mSettings = true;
         mHeld.clear();
         mPending.clear();
-        mStickPointer = -1;
+        mStickPointer = -1; mRStickPointer = -1;
         mMousePointer = -1;
         send();
     }
@@ -596,7 +616,7 @@ public class TouchOverlay extends View {
         mEditSel = null;
         mHeld.clear();
         mPending.clear();
-        mStickPointer = -1;
+        mStickPointer = -1; mRStickPointer = -1;
         send();   /* the game sees nothing pressed while editing */
     }
 
@@ -709,6 +729,18 @@ public class TouchOverlay extends View {
                 mLine.setColor(Color.argb((int) (90 * a), 255, 255, 255));
                 c.drawCircle(1.9f * mU, getHeight() - 1.9f * mU, mStickRadius * 0.8f, mLine);
             }
+        }
+        if (mRStickPointer >= 0) {   /* the batting right stick, while a thumb is on it */
+            mLine.setStrokeWidth(2 * mDp);
+            mLine.setColor(Color.argb((int) (150 * a), 255, 255, 255));
+            mFill.setColor(Color.argb((int) (60 * a), 0, 0, 0));
+            c.drawCircle(mRStickCx, mRStickCy, mStickRadius, mFill);
+            c.drawCircle(mRStickCx, mRStickCy, mStickRadius, mLine);
+            float dx = mRStickX - mRStickCx, dy = mRStickY - mRStickCy;
+            float len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mStickRadius) { dx *= mStickRadius / len; dy *= mStickRadius / len; }
+            mFill.setColor(Color.argb((int) (140 * a), 255, 255, 255));
+            c.drawCircle(mRStickCx + dx, mRStickCy + dy, mStickRadius * 0.45f, mFill);
         }
     }
 
