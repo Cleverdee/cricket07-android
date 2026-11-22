@@ -840,9 +840,13 @@ static void destroy_texture(void *p) {
     for (uint32_t f = 0; f < t->faces; f++)
         for (uint32_t l = 0; l < t->levels; l++) {
             heap_free(t->mem[f][l]);
-            /* level surfaces handed out earlier point into this memory: detach them */
+            /* level surfaces handed out earlier point into this memory: detach them, and drop the texture's own
+               reference (texture_surface: the texture keeps its surfaces alive, as in D3D, so a game may release
+               one and keep using it while the texture lives). Without this every level surface of every texture
+               ever made stayed alive, and long sessions ran out ("too many live COM objects"). */
             Surface *s = t->surfaces[f][l] ? com_data(t->surfaces[f][l]) : NULL;
             if (s) { s->mem = 0; s->container = 0; }
+            if (t->surfaces[f][l]) com_unref(t->surfaces[f][l]);
         }
     free(t);
 }

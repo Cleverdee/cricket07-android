@@ -52,6 +52,11 @@ uint32_t com_new(ComInterface *it, int type, void *data) {
     uint32_t vt = build_vtable(it);
     int idx = g_nfree ? g_free_idx[--g_nfree] : g_nobjs++;
     if (idx >= MAX_OBJS) { fprintf(stderr, "too many live COM objects\n"); abort(); }
+    {   /* a leak shows in the log (and crash reports) long before the limit */
+        static int high = 4096;
+        int live = g_nobjs - 1 - g_nfree;
+        if (live >= high) { fprintf(stderr, "[com] %d live COM objects\n", live); high *= 2; }
+    }
     uint32_t g = heap_alloc(16, 1);
     W32(g, vt);
     W32(g + 4, (uint32_t)idx);
@@ -85,9 +90,10 @@ void com_AddRef(CPU *c) {
     RET(1, o ? (uint32_t)++o->refs : 1);
 }
 
-void com_Release(CPU *c) {
-    ComObj *o = com_get(THIS);
-    if (!o) RET(1, 0);
+/* drops one reference; returns what's left (frees the object at 0 when it has a destroy) */
+uint32_t com_unref(uint32_t g) {
+    ComObj *o = com_get(g);
+    if (!o) return 0;
     int32_t r = --o->refs;
     if (r <= 0 && !o->iface->destroy) o->refs = r = 0;  /* singletons (devices, interfaces): keep alive */
     else if (r <= 0) {
@@ -103,5 +109,10 @@ void com_Release(CPU *c) {
         g_free_idx[g_nfree++] = (int)(o - g_objs);
         pthread_mutex_unlock(&g_com_lock);
     }
-    RET(1, (uint32_t)r);
+    return (uint32_t)r;
+}
+
+void com_Release(CPU *c) {
+    uint32_t r = com_unref(THIS);
+    RET(1, r);
 }

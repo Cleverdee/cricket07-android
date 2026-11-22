@@ -39,6 +39,7 @@ void *com_data(uint32_t guest);
 void com_QueryInterface(CPU *c);
 void com_AddRef(CPU *c);
 void com_Release(CPU *c);
+uint32_t com_unref(uint32_t g);   /* drop a reference from host code (frees at 0) */
 
 extern int g_log_d3d;  /* RC_LOG_D3D: 1 = object creation and unusual calls, 2 = every call */
 
